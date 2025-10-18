@@ -315,44 +315,66 @@ export function ChatKitPanel({
     },
   });
 
-  // ---------- ADDED: diagnostic logging interceptor (typed, very tolerant) ----------
+    // ---------- ADDED: diagnostic logging interceptor (strictly typed) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const originalFetch = window.fetch;
 
-    // Helper types
+    // Types we care about
     type TextPart = { type: "text"; text: string };
     type Role = "user" | "assistant" | "system" | "tool";
     type Message = { role: Role; content: string | TextPart[] };
     type Payload = { input?: string | Message[]; messages?: Message[] };
 
-    function isTextParts(v: unknown): v is TextPart[] {
-      return Array.isArray(v) && v.every(p => !!p && typeof p === "object" && (p as any).type === "text" && typeof (p as any).text === "string");
+    // Type guards (no `any`)
+    function isRecord(v: unknown): v is Record<string, unknown> {
+      return typeof v === "object" && v !== null;
     }
-    function isMsg(v: unknown): v is Message {
-      if (!v || typeof v !== "object") return false;
-      const o = v as any;
-      return typeof o.role === "string" && (typeof o.content === "string" || isTextParts(o.content));
+    function isTextPartArray(v: unknown): v is TextPart[] {
+      return (
+        Array.isArray(v) &&
+        v.every(
+          (p) =>
+            isRecord(p) &&
+            p["type"] === "text" &&
+            typeof p["text"] === "string"
+        )
+      );
+    }
+    function isMessage(v: unknown): v is Message {
+      if (!isRecord(v)) return false;
+      const role = v["role"];
+      const content = v["content"];
+      return (
+        typeof role === "string" &&
+        (typeof content === "string" || isTextPartArray(content))
+      );
     }
     function firstUserText(messages?: Message[]): string {
       if (!messages) return "";
-      const u = messages.find(m => m.role === "user");
+      const u = messages.find((m) => m.role === "user");
       if (!u) return "";
       if (typeof u.content === "string") return u.content;
-      const t = u.content.find(p => p.type === "text");
+      const t = u.content.find((p) => p.type === "text");
       return t ? t.text : "";
     }
     function extractUserText(raw: unknown): string {
       const p = raw as Payload | null;
       if (!p) return "";
       if (typeof p.input === "string") return p.input;
-      if (Array.isArray(p.input) && p.input.every(isMsg)) return firstUserText(p.input);
-      if (Array.isArray(p.messages) && p.messages.every(isMsg)) return firstUserText(p.messages);
+      if (Array.isArray(p.input) && p.input.every(isMessage)) {
+        return firstUserText(p.input);
+      }
+      if (Array.isArray(p.messages) && p.messages.every(isMessage)) {
+        return firstUserText(p.messages);
+      }
       return "";
     }
-
-    async function readBodyAsText(input: RequestInfo | URL, init?: RequestInit): Promise<string> {
+    async function readBodyAsText(
+      input: RequestInfo | URL,
+      init?: RequestInit
+    ): Promise<string> {
       try {
         if (input instanceof Request) {
           const clone = input.clone();
@@ -362,9 +384,14 @@ export function ChatKitPanel({
           if (typeof init.body === "string") return init.body;
           if (init.body instanceof Blob) return await (init.body as Blob).text();
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
       return "";
     }
+
+    // eslint-disable-next-line no-console
+    console.log("[intercept] mounted");
 
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
@@ -377,8 +404,9 @@ export function ChatKitPanel({
             ? input.url
             : String(input);
 
-        const method =
-          (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+        const method = (
+          init?.method ?? (input instanceof Request ? input.method : "GET")
+        ).toUpperCase();
 
         // Skip our own endpoints
         if (url.includes("/api/log-event") || url.includes("/api/create-session")) {
@@ -389,12 +417,16 @@ export function ChatKitPanel({
         if (method === "POST") {
           const bodyText = await readBodyAsText(input, init);
           let parsed: unknown = null;
-          try { parsed = bodyText ? JSON.parse(bodyText) : null; } catch { parsed = null; }
+          try {
+            parsed = bodyText ? JSON.parse(bodyText) : null;
+          } catch {
+            parsed = null;
+          }
 
           const userText = extractUserText(parsed);
           const sample = bodyText ? bodyText.slice(0, 200) : "";
 
-          // Always send a log, even if userText is empty. This proves which endpoint fires.
+          // Fire-and-forget log so we never block the chat
           void fetch("/api/log-event", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -405,17 +437,21 @@ export function ChatKitPanel({
                 path: location.pathname,
                 endpoint: url.replace(/^https?:\/\//, ""),
                 method,
-                bodySample: sample
-              }
-            })
+                bodySample: sample,
+              },
+            }),
           });
 
-          // Console marker so you can see it immediately
           // eslint-disable-next-line no-console
-          console.log("[intercept] POST ->", url, "| userText:", userText.slice(0, 120));
+          console.log(
+            "[intercept] POST ->",
+            url,
+            "| userText:",
+            (userText || "").slice(0, 120)
+          );
         }
       } catch {
-        // Never block the original request
+        // never block the original request
       }
 
       return originalFetch(input as RequestInfo, init as RequestInit);
@@ -426,6 +462,7 @@ export function ChatKitPanel({
     };
   }, []);
   // ---------- END ADDED ----------
+
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
