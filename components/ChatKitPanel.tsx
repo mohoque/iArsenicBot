@@ -315,15 +315,16 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ADDED: universal logging interceptor (fetch + sendBeacon + XHR) ----------
+    // ---------- ADDED: universal logging interceptor (fetch + beacon + XHR + WS, typed) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const originalFetch = window.fetch;
     const originalBeacon = navigator.sendBeacon?.bind(navigator);
     const originalXhrSend = XMLHttpRequest.prototype.send;
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    const OriginalWS = window.WebSocket;
 
-    // Types we care about
     type TextPart = { type: "text"; text: string };
     type Role = "user" | "assistant" | "system" | "tool";
     type Message = { role: Role; content: string | TextPart[] };
@@ -358,44 +359,46 @@ export function ChatKitPanel({
       return "";
     }
 
-    async function blobToText(b: Blob): Promise<string> {
-      try { return await b.text(); } catch { return ""; }
-    }
     async function bodyToText(body: unknown): Promise<string> {
       try {
         if (typeof body === "string") return body;
-        if (body instanceof Blob) return blobToText(body);
+        if (body instanceof Blob) return body.text();
         if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
-        if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body as ArrayBufferView as unknown as ArrayBuffer);
+        if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body.buffer as ArrayBuffer);
       } catch {}
       return "";
     }
 
-    // eslint-disable-next-line no-console
     console.log("[intercept] mounted");
 
     // ---- fetch ----
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
         const url =
-          typeof input === "string" ? input :
-          input instanceof URL ? input.toString() :
-          input instanceof Request ? input.url : String(input);
-        const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+            ? input.toString()
+            : input instanceof Request
+            ? input.url
+            : String(input);
+
+        const method =
+          (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
         if (!url.includes("/api/log-event") && method === "POST") {
           let text = "";
           if (input instanceof Request) {
             const clone = input.clone();
             text = await clone.text();
-          } else if (init?.body) {
+          } else if (init?.body !== undefined) {
             text = await bodyToText(init.body);
           }
 
           let parsed: unknown = null;
           try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
-
           const userText = extractUserText(parsed);
+
           void fetch("/api/log-event", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -410,7 +413,7 @@ export function ChatKitPanel({
               }
             })
           });
-          // eslint-disable-next-line no-console
+
           console.log("[intercept] POST(fetch) ->", url, "| userText:", (userText || "").slice(0, 120));
         }
       } catch {}
@@ -419,15 +422,16 @@ export function ChatKitPanel({
 
     // ---- sendBeacon ----
     if (originalBeacon) {
-      navigator.sendBeacon = ((url: string | URL, data?: BodyInit | null) => {
+      navigator.sendBeacon = (url: string | URL, data?: BodyInit | null): boolean => {
         try {
           const href = typeof url === "string" ? url : url.toString();
           if (!href.includes("/api/log-event")) {
-            void (async () => {
+            (async () => {
               const text = await bodyToText(data ?? "");
               let parsed: unknown = null;
               try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
               const userText = extractUserText(parsed);
+
               void fetch("/api/log-event", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -442,26 +446,43 @@ export function ChatKitPanel({
                   }
                 })
               });
-              // eslint-disable-next-line no-console
+
               console.log("[intercept] POST(beacon) ->", href, "| userText:", (userText || "").slice(0, 120));
             })();
           }
         } catch {}
         return originalBeacon(url, data);
-      }) as typeof navigator.sendBeacon;
+      };
     }
 
     // ---- XHR ----
-    XMLHttpRequest.prototype.send = function (this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
+    XMLHttpRequest.prototype.open = function open(
+      method: string,
+      url: string | URL,
+      async?: boolean,
+      username?: string | null,
+      password?: string | null
+    ): void {
+      const self = this as XMLHttpRequest & { __url?: string; __method?: string };
+      self.__url = typeof url === "string" ? url : url.toString();
+      self.__method = (method || "GET").toUpperCase();
+      return originalXhrOpen.call(this, method, url, async ?? true, username ?? null, password ?? null);
+    };
+
+    XMLHttpRequest.prototype.send = function send(
+      body?: Document | XMLHttpRequestBodyInit | null
+    ): void {
       try {
-        const url = (this as XMLHttpRequest & { __url?: string }).__url ?? this.responseURL;
-        const method = (this as XMLHttpRequest & { __method?: string }).__method ?? "POST";
+        const self = this as XMLHttpRequest & { __url?: string; __method?: string };
+        const url = self.__url ?? this.responseURL;
+        const method = self.__method ?? "POST";
         if (method === "POST" && url && !url.includes("/api/log-event")) {
-          void (async () => {
+          (async () => {
             const text = await bodyToText(body ?? "");
             let parsed: unknown = null;
             try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
             const userText = extractUserText(parsed);
+
             void fetch("/api/log-event", {
               method: "POST",
               headers: { "content-type": "application/json" },
@@ -476,30 +497,62 @@ export function ChatKitPanel({
                 }
               })
             });
-            // eslint-disable-next-line no-console
+
             console.log("[intercept] POST(xhr) ->", url, "| userText:", (userText || "").slice(0, 120));
           })();
         }
       } catch {}
-      return originalXhrSend.call(this, body as never);
+      return originalXhrSend.call(this, body as Document | XMLHttpRequestBodyInit | null);
     };
 
-    // Patch open() to remember method and URL
-    const originalXhrOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (method: string, url: string | URL) {
-      (this as XMLHttpRequest & { __url?: string; __method?: string }).__url = typeof url === "string" ? url : url.toString();
-      (this as XMLHttpRequest & { __url?: string; __method?: string }).__method = method.toUpperCase();
-      return originalXhrOpen.apply(this, arguments as unknown as any);
-    };
+    // ---- WebSocket ----
+    class LoggedWS extends OriginalWS {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        const u = typeof url === "string" ? url : url.toString();
+        console.log("[intercept] WebSocket open ->", u);
+      }
+      send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+        try {
+          const sample =
+            typeof data === "string"
+              ? data.slice(0, 300)
+              : data instanceof Blob
+              ? "(blob)"
+              : ArrayBuffer.isView(data)
+              ? "(arraybuffer view)"
+              : "(arraybuffer)";
+          void fetch("/api/log-event", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              role: "user",
+              text: "",
+              meta: {
+                path: location.pathname,
+                endpoint: "WebSocket",
+                method: "WS",
+                bodySample: sample
+              }
+            })
+          });
+          console.log("[intercept] POST(ws) -> sample:", sample);
+        } catch {}
+        return super.send(data);
+      }
+    }
+    window.WebSocket = LoggedWS as unknown as typeof WebSocket;
 
     return () => {
       window.fetch = originalFetch;
       if (originalBeacon) navigator.sendBeacon = originalBeacon;
       XMLHttpRequest.prototype.send = originalXhrSend;
       XMLHttpRequest.prototype.open = originalXhrOpen;
+      window.WebSocket = OriginalWS as unknown as typeof WebSocket;
     };
   }, []);
   // ---------- END ADDED ----------
+
 
 
   const activeError = errors.session ?? errors.integration;
