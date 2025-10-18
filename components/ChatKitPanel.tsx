@@ -315,86 +315,60 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ADDED: robust logging interceptor (typed) ----------
+  // ---------- ADDED: diagnostic logging interceptor (typed, very tolerant) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const originalFetch = window.fetch;
 
-    // Minimal shapes we care about
+    // Helper types
     type TextPart = { type: "text"; text: string };
     type Role = "user" | "assistant" | "system" | "tool";
     type Message = { role: Role; content: string | TextPart[] };
-    type ResponsesShape = { input?: string | Message[]; messages?: Message[] };
+    type Payload = { input?: string | Message[]; messages?: Message[] };
 
-    function isTextPartArray(v: unknown): v is TextPart[] {
-      return Array.isArray(v) &&
-        v.every(p => typeof p === "object" && p !== null &&
-          (p as { type?: unknown }).type === "text" &&
-          typeof (p as { text?: unknown }).text === "string");
+    function isTextParts(v: unknown): v is TextPart[] {
+      return Array.isArray(v) && v.every(p => !!p && typeof p === "object" && (p as any).type === "text" && typeof (p as any).text === "string");
     }
-
-    function isMessage(obj: unknown): obj is Message {
-      if (typeof obj !== "object" || obj === null) return false;
-      const o = obj as { role?: unknown; content?: unknown };
-      const roleOk = typeof o.role === "string";
-      const contentOk = typeof o.content === "string" || isTextPartArray(o.content as unknown);
-      return roleOk && contentOk;
+    function isMsg(v: unknown): v is Message {
+      if (!v || typeof v !== "object") return false;
+      const o = v as any;
+      return typeof o.role === "string" && (typeof o.content === "string" || isTextParts(o.content));
     }
-
-    function findUserTextFromMessages(messages?: Message[]): string {
+    function firstUserText(messages?: Message[]): string {
       if (!messages) return "";
       const u = messages.find(m => m.role === "user");
       if (!u) return "";
       if (typeof u.content === "string") return u.content;
-      const t = u.content.find(part => part.type === "text");
+      const t = u.content.find(p => p.type === "text");
       return t ? t.text : "";
     }
-
-    function extractUserText(payload: unknown): string {
-      const p = payload as ResponsesShape | undefined;
+    function extractUserText(raw: unknown): string {
+      const p = raw as Payload | null;
       if (!p) return "";
-
       if (typeof p.input === "string") return p.input;
-      if (Array.isArray(p.input) && p.input.every(isMessage)) {
-        return findUserTextFromMessages(p.input);
-      }
-      if (Array.isArray(p.messages) && p.messages.every(isMessage)) {
-        return findUserTextFromMessages(p.messages);
-      }
+      if (Array.isArray(p.input) && p.input.every(isMsg)) return firstUserText(p.input);
+      if (Array.isArray(p.messages) && p.messages.every(isMsg)) return firstUserText(p.messages);
       return "";
     }
 
-    async function readBodySafely(input: RequestInfo | URL, init?: RequestInit): Promise<unknown> {
-      // If a Request was passed, clone and read its body
-      if (input instanceof Request) {
-        try {
+    async function readBodyAsText(input: RequestInfo | URL, init?: RequestInit): Promise<string> {
+      try {
+        if (input instanceof Request) {
           const clone = input.clone();
-          const text = await clone.text();
-          return text ? JSON.parse(text) : null;
-        } catch { return null; }
-      }
-      // Otherwise check init.body
-      if (init?.body) {
-        try {
-          if (typeof init.body === "string") return JSON.parse(init.body);
-          if (init.body instanceof Blob) {
-            const t = await (init.body as Blob).text();
-            return JSON.parse(t);
-          }
-          // If ReadableStream, skip to avoid consuming it
-        } catch { return null; }
-      }
-      return null;
+          return await clone.text();
+        }
+        if (init?.body) {
+          if (typeof init.body === "string") return init.body;
+          if (init.body instanceof Blob) return await (init.body as Blob).text();
+        }
+      } catch {}
+      return "";
     }
-
-    // Helpful marker that the interceptor mounted
-    // eslint-disable-next-line no-console
-    console.log("[intercept] mounted");
 
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
-        const urlStr =
+        const url =
           typeof input === "string"
             ? input
             : input instanceof URL
@@ -407,41 +381,38 @@ export function ChatKitPanel({
           (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
         // Skip our own endpoints
-        if (urlStr.includes("/api/log-event") || urlStr.includes("/api/create-session")) {
+        if (url.includes("/api/log-event") || url.includes("/api/create-session")) {
           return originalFetch(input as RequestInfo, init as RequestInit);
         }
 
-        // Only inspect POSTs with JSON content-type
-        const ctype =
-          (init?.headers && typeof init.headers === "object"
-            ? (init.headers as Record<string, string>)["content-type"]
-            : undefined) ||
-          (input instanceof Request ? input.headers.get("content-type") ?? undefined : undefined);
+        // Observe every POST. Body may be JSON, text, or a stream.
+        if (method === "POST") {
+          const bodyText = await readBodyAsText(input, init);
+          let parsed: unknown = null;
+          try { parsed = bodyText ? JSON.parse(bodyText) : null; } catch { parsed = null; }
 
-        const looksJson = ctype ? /application\/json/i.test(ctype) : true;
+          const userText = extractUserText(parsed);
+          const sample = bodyText ? bodyText.slice(0, 200) : "";
 
-        if (method === "POST" && looksJson) {
-          const json = await readBodySafely(input, init);
-          const userText = extractUserText(json);
+          // Always send a log, even if userText is empty. This proves which endpoint fires.
+          void fetch("/api/log-event", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              role: "user",
+              text: userText || "",
+              meta: {
+                path: location.pathname,
+                endpoint: url.replace(/^https?:\/\//, ""),
+                method,
+                bodySample: sample
+              }
+            })
+          });
 
-          if (userText) {
-            // eslint-disable-next-line no-console
-            console.log("[intercept] POST →", urlStr, "| userText:", userText.slice(0, 120));
-
-            // Fire-and-forget log to your API
-            void fetch("/api/log-event", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                role: "user",
-                text: userText,
-                meta: {
-                  path: location.pathname,
-                  endpoint: urlStr.replace(/^https?:\/\//, ""),
-                },
-              }),
-            });
-          }
+          // Console marker so you can see it immediately
+          // eslint-disable-next-line no-console
+          console.log("[intercept] POST ->", url, "| userText:", userText.slice(0, 120));
         }
       } catch {
         // Never block the original request
@@ -455,9 +426,6 @@ export function ChatKitPanel({
     };
   }, []);
   // ---------- END ADDED ----------
-
-
-
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;

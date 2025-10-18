@@ -19,19 +19,19 @@ export async function POST(req: NextRequest) {
       sessionId: cap(body.sessionId, 200),
       threadId: cap(body.threadId, 200),
       meta: body.meta ?? {},
-      ua: cap(req.headers.get('user-agent'), 400),
+      ua: cap(req.headers.get('user-agent'), 400)
     };
 
     const key = `logs/${new Date().toISOString().slice(0, 10)}.ndjson`;
     await put(key, JSON.stringify(record) + '\n', {
-      access: 'public',
+      access: 'public',               // keep public
       addRandomSuffix: false,
       contentType: 'application/x-ndjson',
-      token: process.env.BLOB_READ_WRITE_TOKEN, // uses your token
+      token: process.env.BLOB_READ_WRITE_TOKEN
     });
 
-    // Optional echo to console for quick checks
-    console.log('[log-event]', record.role, record.text.slice(0, 120));
+    // Optional echo
+    console.log('[log-event]', record.role, record.text.slice(0, 80));
 
     return NextResponse.json({ ok: true });
   } catch (err) {
