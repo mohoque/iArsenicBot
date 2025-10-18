@@ -580,8 +580,9 @@ export function ChatKitPanel({
     if (typeof window === "undefined") return;
 
     function attachTo(hostEl: HTMLElement) {
+      type WithShadow = HTMLElement & { shadowRoot?: ShadowRoot };
       const root: ShadowRoot | null =
-        (hostEl as any).shadowRoot ?? null;
+        (hostEl as WithShadow).shadowRoot ?? null;
       if (!root) {
         console.warn("[observer] shadowRoot not found on <openai-chatkit>");
         return;
