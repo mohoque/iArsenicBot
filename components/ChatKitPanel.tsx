@@ -371,54 +371,242 @@ export function ChatKitPanel({
 
     console.log("[intercept] mounted");
 
-    // ---- fetch ----
+        // ---- fetch (logs user turn + parses streamed assistant reply) ----
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      // Helper: decide if this request is a chat request we care about
+      const asUrl = (v: RequestInfo | URL): string =>
+        typeof v === "string"
+          ? v
+          : v instanceof URL
+          ? v.toString()
+          : v instanceof Request
+          ? v.url
+          : String(v);
+
+      const url = asUrl(input);
+      const method = (
+        init?.method ?? (input instanceof Request ? input.method : "GET")
+      ).toUpperCase();
+
+      // Skip bootstrap, our own logger, and framework noise
+      const shouldSkip =
+        url.includes("/api/create-session") ||
+        url.includes("/api/log-event") ||
+        url.includes("/track?") ||
+        url.includes("/_next/");
+
+      // Send the real network request
+      const resp = await originalFetch(input as RequestInfo, init as RequestInit);
+
       try {
-        const url =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-            ? input.toString()
-            : input instanceof Request
-            ? input.url
-            : String(input);
-
-        const method =
-          (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-
-        if (!url.includes("/api/log-event") && method === "POST") {
-          let text = "";
+        if (!shouldSkip && method === "POST") {
+          // ---------- 1) Best-effort USER text ----------
+          let requestBody = "";
           if (input instanceof Request) {
             const clone = input.clone();
-            text = await clone.text();
+            requestBody = await clone.text();
           } else if (init?.body !== undefined) {
-            text = await bodyToText(init.body);
+            requestBody = await bodyToText(init.body);
           }
 
-          let parsed: unknown = null;
-          try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
-          const userText = extractUserText(parsed);
+          // Parse common shapes
+          type TextPart = { type: "text"; text: string };
+          type Role = "user" | "assistant" | "system" | "tool";
+          type Message = { role: Role; content: string | TextPart[] };
+          type Payload = { input?: string | Message[]; messages?: Message[] };
 
-          void fetch("/api/log-event", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              role: "user",
-              text: userText || "",
-              meta: {
-                path: location.pathname,
-                endpoint: url.replace(/^https?:\/\//, ""),
-                method,
-                bodySample: text.slice(0, 300)
+          const getUserText = (raw: string): string => {
+            try {
+              const p = JSON.parse(raw) as Payload;
+              if (typeof p?.input === "string") return p.input;
+              if (Array.isArray(p?.input)) {
+                const u = p.input.find(m => m && m.role === "user");
+                if (!u) return "";
+                if (typeof u.content === "string") return u.content;
+                const t = Array.isArray(u.content)
+                  ? u.content.find(c => c && (c as TextPart).type === "text")
+                  : null;
+                return t && typeof (t as TextPart).text === "string"
+                  ? (t as TextPart).text
+                  : "";
               }
-            })
-          });
+              if (Array.isArray(p?.messages)) {
+                const u = p.messages.find(m => m && m.role === "user");
+                if (!u) return "";
+                if (typeof u.content === "string") return u.content;
+                const t = Array.isArray(u.content)
+                  ? u.content.find(c => c && (c as TextPart).type === "text")
+                  : null;
+                return t && typeof (t as TextPart).text === "string"
+                  ? (t as TextPart).text
+                  : "";
+              }
+            } catch {
+              // ignore
+            }
+            return "";
+          };
 
-          console.log("[intercept] POST(fetch) ->", url, "| userText:", (userText || "").slice(0, 120));
+          const userText = requestBody ? getUserText(requestBody) : "";
+
+          if (userText.trim().length > 0) {
+            void fetch("/api/log-event", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                role: "user",
+                text: userText,
+                meta: {
+                  path: location.pathname,
+                  endpoint: url.replace(/^https?:\/\//, ""),
+                  method,
+                },
+              }),
+            });
+          }
+
+          // ---------- 2) Stream-parse ASSISTANT text ----------
+          // We clone the response, read the stream, and accumulate plain text.
+          // This supports OpenAI Responses SSE lines containing JSON with fields like:
+          // - "output_text": "..."
+          // - or incremental "delta": { "type":"output_text.delta", "text":"..." }
+          const ct = resp.headers.get("content-type") ?? "";
+          const looksStream = ct.includes("text/event-stream");
+
+          const accumulateAssistant = async (): Promise<void> => {
+            try {
+              const cloned = resp.clone();
+              const reader = cloned.body?.getReader();
+              if (!reader) return;
+
+              const decoder = new TextDecoder();
+              let buffer = "";
+              let full = "";
+
+              // tolerant extractors
+              const pullTextFromLine = (line: string): string => {
+                // Lines usually start with "data: {json...}"
+                const i = line.indexOf("{");
+                if (i < 0) return "";
+                try {
+                  const obj = JSON.parse(line.slice(i));
+                  // 1) direct full text
+                  const ot = (obj as { output_text?: unknown }).output_text;
+                  if (typeof ot === "string") return ot;
+
+                  // 2) aggregated array of output_text
+                  if (Array.isArray(ot) && ot.every(v => typeof v === "string")) {
+                    return (ot as string[]).join("");
+                  }
+
+                  // 3) delta events
+                  const delta =
+                    (obj as { delta?: unknown }).delta ??
+                    (obj as { event?: unknown; text?: unknown }).text;
+                  if (typeof delta === "string") return delta;
+
+                  if (isRecord(obj) && typeof (obj as { text?: unknown }).text === "string") {
+                    return String((obj as { text?: unknown }).text);
+                  }
+                } catch {
+                  // ignore parse errors per line
+                }
+                return "";
+              };
+
+              // stream loop
+              for (;;) {
+                const res = await reader.read();
+                if (res.done) break;
+                buffer += decoder.decode(res.value, { stream: true });
+
+                // split safely on newlines
+                const lines = buffer.split(/\r?\n/);
+                buffer = lines.pop() ?? ""; // keep partial
+
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (!trimmed.startsWith("data:")) continue;
+                  const text = pullTextFromLine(trimmed);
+                  if (text) full += text;
+                }
+              }
+              // flush the last buffered chunk
+              if (buffer.startsWith("data:")) {
+                const tail = pullTextFromLine(buffer);
+                if (tail) full += tail;
+              }
+
+              if (full.trim().length > 0) {
+                void fetch("/api/log-event", {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    role: "assistant",
+                    text: full,
+                    meta: {
+                      path: location.pathname,
+                      endpoint: url.replace(/^https?:\/\//, ""),
+                      method: `STREAM:${looksStream ? "SSE" : "unknown"}`,
+                    },
+                  }),
+                });
+              }
+            } catch {
+              // best effort only
+            }
+          };
+
+          if (looksStream) {
+            // do not block the UI; parse in background
+            void accumulateAssistant();
+          } else {
+            // Non-streaming: clone and try to parse JSON directly
+            try {
+              const cloned = resp.clone();
+              const text = await cloned.text();
+              // attempt very tolerant extraction
+              let assistant = "";
+              try {
+                const obj = JSON.parse(text) as Record<string, unknown>;
+                // Responses API can return output_text as string or array
+                const ot = obj["output_text"];
+                if (typeof ot === "string") assistant = ot;
+                else if (Array.isArray(ot) && ot.every(v => typeof v === "string")) {
+                  assistant = (ot as string[]).join("");
+                }
+              } catch {
+                // if plain text, use as is
+                if (typeof text === "string") assistant = text;
+              }
+
+              if (assistant.trim().length > 0) {
+                void fetch("/api/log-event", {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    role: "assistant",
+                    text: assistant,
+                    meta: {
+                      path: location.pathname,
+                      endpoint: url.replace(/^https?:\/\//, ""),
+                      method: "POST:nonstream",
+                    },
+                  }),
+                });
+              }
+            } catch {
+              // ignore
+            }
+          }
         }
-      } catch {}
-      return originalFetch(input as RequestInfo, init as RequestInit);
+      } catch {
+        // never block
+      }
+
+      return resp;
     };
+
 
     // ---- sendBeacon ----
     if (originalBeacon) {
