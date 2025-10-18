@@ -1,10 +1,9 @@
 export const runtime = "edge";
 
 import { NextRequest, NextResponse } from "next/server";
-import { list, put, remove } from "@vercel/blob";
+import { list, put, del } from "@vercel/blob";
 
 /**
- * Works with latest @vercel/blob.
  * Authorisation:
  *  - Automatic cron: Authorization: Bearer <CRON_SECRET>
  *  - Manual: ?key=<LOG_ADMIN_KEY>
@@ -37,20 +36,20 @@ export async function GET(req: NextRequest) {
   const outKey = `logs/${day}.ndjson`;
 
   // Skip if NDJSON already exists and not forcing
-  const existing = await list({ prefix: outKey });
+  const existing = await list({ prefix: outKey, token: process.env.BLOB_READ_WRITE_TOKEN });
   if (!force && existing.blobs.length > 0) {
-    return NextResponse.json({ ok: true, message: "Already compacted", day });
+    return NextResponse.json({ ok: true, message: "Already compacted", day, outKey, written: false, deleted: 0 });
   }
 
   // Gather per-event JSON blobs
-  const items = await list({ prefix });
+  const items = await list({ prefix, token: process.env.BLOB_READ_WRITE_TOKEN });
   const files = items.blobs.filter((b) => b.pathname.endsWith(".json"));
 
   if (files.length === 0) {
-    return NextResponse.json({ ok: true, message: "No event files", day });
+    return NextResponse.json({ ok: true, message: "No event files", day, written: false, deleted: 0 });
   }
 
-  // Read each blob through HTTP
+  // Read each blob via HTTP (files are public)
   const lines: string[] = [];
   const batchSize = 40;
   for (let i = 0; i < files.length; i += batchSize) {
@@ -75,13 +74,13 @@ export async function GET(req: NextRequest) {
     access: "public",
     addRandomSuffix: false,
     contentType: "application/x-ndjson",
-    token: process.env.BLOB_READ_WRITE_TOKEN,
+    token: process.env.BLOB_READ_WRITE_TOKEN
   });
 
   // Delete originals
   let deleted = 0;
   for (const f of files) {
-    await remove(f.pathname, { token: process.env.BLOB_READ_WRITE_TOKEN });
+    await del(f.pathname, { token: process.env.BLOB_READ_WRITE_TOKEN });
     deleted += 1;
   }
 
