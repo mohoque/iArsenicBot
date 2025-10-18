@@ -13,7 +13,7 @@ export const STARTER_PROMPTS: StartScreenPrompt[] = [
   },
 ];
 
-export const PLACEHOLDER_INPUT = "Ask anything...";
+export const PLACEHOLDER_INPUT = "কি জানতে চান...";
 
 export const GREETING = "💧 স্বাগতম! আমি বাংলাদেশের পানীয় জল, নলকূপ ও আর্সেনিক ঝুঁকি নিয়ে তথ্য দিই।";
 

@@ -315,7 +315,7 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ADDED: diagnostic logging interceptor (strictly typed) ----------
+    // ---------- ADDED: robust interceptor for "conversation" + all JSON POSTs ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -327,54 +327,37 @@ export function ChatKitPanel({
     type Message = { role: Role; content: string | TextPart[] };
     type Payload = { input?: string | Message[]; messages?: Message[] };
 
-    // Type guards (no `any`)
     function isRecord(v: unknown): v is Record<string, unknown> {
       return typeof v === "object" && v !== null;
     }
     function isTextPartArray(v: unknown): v is TextPart[] {
-      return (
-        Array.isArray(v) &&
-        v.every(
-          (p) =>
-            isRecord(p) &&
-            p["type"] === "text" &&
-            typeof p["text"] === "string"
-        )
+      return Array.isArray(v) && v.every(
+        p => isRecord(p) && p["type"] === "text" && typeof p["text"] === "string"
       );
     }
     function isMessage(v: unknown): v is Message {
-      if (!isRecord(v)) return false;
-      const role = v["role"];
-      const content = v["content"];
-      return (
-        typeof role === "string" &&
-        (typeof content === "string" || isTextPartArray(content))
-      );
+      return isRecord(v)
+        && typeof v["role"] === "string"
+        && (typeof v["content"] === "string" || isTextPartArray(v["content"]));
     }
     function firstUserText(messages?: Message[]): string {
       if (!messages) return "";
-      const u = messages.find((m) => m.role === "user");
+      const u = messages.find(m => m.role === "user");
       if (!u) return "";
       if (typeof u.content === "string") return u.content;
-      const t = u.content.find((p) => p.type === "text");
+      const t = u.content.find(p => p.type === "text");
       return t ? t.text : "";
     }
     function extractUserText(raw: unknown): string {
       const p = raw as Payload | null;
       if (!p) return "";
       if (typeof p.input === "string") return p.input;
-      if (Array.isArray(p.input) && p.input.every(isMessage)) {
-        return firstUserText(p.input);
-      }
-      if (Array.isArray(p.messages) && p.messages.every(isMessage)) {
-        return firstUserText(p.messages);
-      }
+      if (Array.isArray(p.input) && p.input.every(isMessage)) return firstUserText(p.input);
+      if (Array.isArray(p.messages) && p.messages.every(isMessage)) return firstUserText(p.messages);
       return "";
     }
-    async function readBodyAsText(
-      input: RequestInfo | URL,
-      init?: RequestInit
-    ): Promise<string> {
+
+    async function readBodyAsText(input: RequestInfo | URL, init?: RequestInit): Promise<string> {
       try {
         if (input instanceof Request) {
           const clone = input.clone();
@@ -384,9 +367,7 @@ export function ChatKitPanel({
           if (typeof init.body === "string") return init.body;
           if (init.body instanceof Blob) return await (init.body as Blob).text();
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
       return "";
     }
 
@@ -396,37 +377,33 @@ export function ChatKitPanel({
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
         const url =
-          typeof input === "string"
-            ? input
-            : input instanceof URL
-            ? input.toString()
-            : input instanceof Request
-            ? input.url
-            : String(input);
+          typeof input === "string" ? input :
+          input instanceof URL ? input.toString() :
+          input instanceof Request ? input.url : String(input);
 
-        const method = (
-          init?.method ?? (input instanceof Request ? input.method : "GET")
-        ).toUpperCase();
+        const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
         // Skip our own endpoints
         if (url.includes("/api/log-event") || url.includes("/api/create-session")) {
           return originalFetch(input as RequestInfo, init as RequestInit);
         }
 
-        // Observe every POST. Body may be JSON, text, or a stream.
-        if (method === "POST") {
+        // We care about:
+        //  - ChatKit's "conversation" endpoint
+        //  - Any OpenAI v1 JSON POST
+        const looksLikeChatKitConversation = /\/conversation(\?|$)/.test(url);
+        const looksLikeOpenAI =
+          /api\.openai\.com\/v1\/(responses|agent-responses|chat\/completions)/.test(url);
+
+        if (method === "POST" && (looksLikeChatKitConversation || looksLikeOpenAI)) {
           const bodyText = await readBodyAsText(input, init);
           let parsed: unknown = null;
-          try {
-            parsed = bodyText ? JSON.parse(bodyText) : null;
-          } catch {
-            parsed = null;
-          }
+          try { parsed = bodyText ? JSON.parse(bodyText) : null; } catch { parsed = null; }
 
           const userText = extractUserText(parsed);
-          const sample = bodyText ? bodyText.slice(0, 200) : "";
+          const sample = bodyText ? bodyText.slice(0, 300) : "";
 
-          // Fire-and-forget log so we never block the chat
+          // Fire and forget; never block the request
           void fetch("/api/log-event", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -437,22 +414,15 @@ export function ChatKitPanel({
                 path: location.pathname,
                 endpoint: url.replace(/^https?:\/\//, ""),
                 method,
-                bodySample: sample,
-              },
-            }),
+                bodySample: sample
+              }
+            })
           });
 
           // eslint-disable-next-line no-console
-          console.log(
-            "[intercept] POST ->",
-            url,
-            "| userText:",
-            (userText || "").slice(0, 120)
-          );
+          console.log("[intercept] POST ->", url, "| userText:", (userText || "").slice(0, 120));
         }
-      } catch {
-        // never block the original request
-      }
+      } catch {}
 
       return originalFetch(input as RequestInfo, init as RequestInit);
     };
@@ -462,6 +432,7 @@ export function ChatKitPanel({
     };
   }, []);
   // ---------- END ADDED ----------
+
 
 
   const activeError = errors.session ?? errors.integration;
