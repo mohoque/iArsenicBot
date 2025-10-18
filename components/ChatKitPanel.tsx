@@ -574,95 +574,149 @@ export function ChatKitPanel({
   }, []); // once
 
   /* ------------------------------------------------------------------------ */
-  /* DOM Observer: logs turns by watching rendered messages                   */
+  /* DOM Observer: robust logger (finds messages across ChatKit variants)     */
   /* ------------------------------------------------------------------------ */
-
   useEffect(() => {
-    if (!isBrowser) return;
+    if (typeof window === "undefined") return;
 
-    const attach = (hostEl: HTMLElement) => {
+    function attachTo(hostEl: HTMLElement) {
       const root: ShadowRoot | null =
-        (hostEl as unknown as { shadowRoot?: ShadowRoot }).shadowRoot ?? null;
-      if (!root) return;
+        (hostEl as any).shadowRoot ?? null;
+      if (!root) {
+        console.warn("[observer] shadowRoot not found on <openai-chatkit>");
+        return;
+      }
 
-      // Track which text fragments we have handled to avoid duplicates
+      console.log("[observer] attached to shadowRoot");
+
+      // A strong set to deduplicate lines we already sent
       const seen = new Set<string>();
 
-      const scanNode = (container: ParentNode) => {
-        const elements = Array.from(
+      // Try to infer role from attributes/classes on a node or its ancestors
+      function inferRole(el: Element | null): "user" | "assistant" | "" {
+        for (let n: Element | null = el; n; n = n.parentElement) {
+          const dr = n.getAttribute?.("data-role") || n.getAttribute?.("data-message-role") || "";
+          if (dr === "user" || dr === "assistant") return dr as "user" | "assistant";
+
+          const cls = (n as HTMLElement).className || "";
+          if (/\bassistant\b/i.test(cls)) return "assistant";
+          if (/\buser\b/i.test(cls)) return "user";
+
+          const aria = n.getAttribute?.("aria-label") || "";
+          if (/assistant/i.test(aria)) return "assistant";
+          if (/user/i.test(aria) || /you/i.test(aria)) return "user";
+        }
+        return "";
+      }
+
+      // Gather message-like nodes and emit turns
+      function scan(container: ParentNode) {
+        const candidates = Array.from(
           (container as Element).querySelectorAll<HTMLElement>(
-            "[data-role],[data-message-role]"
+            [
+              // preferred data attributes (newer builds)
+              "[data-role]", "[data-message-role]",
+              // common containers in feeds
+              '[role="listitem"]', "article", "li",
+              // fallback to anything that looks like a message bubble
+              '[class*="message"]', '[class*="bubble"]'
+            ].join(",")
           )
         );
 
-        for (const el of elements) {
-          const roleAttr =
-            el.getAttribute("data-role") ?? el.getAttribute("data-message-role") ?? "";
-          const role = roleAttr === "user" || roleAttr === "assistant" ? roleAttr : "";
+        for (const node of candidates) {
+          // Plain text view
+          const text = (node.innerText || "").trim();
+          if (!text) continue;
 
-          const text = (el.innerText || "").trim();
-          if (!role || !text) continue;
+          const role = inferRole(node);
+          if (role !== "user" && role !== "assistant") continue;
 
-          const key = `${role}:${text.slice(0, 200)}`;
+          // A stable dedupe key
+          const key = `${role}:${text.slice(0, 240)}`;
           if (seen.has(key)) continue;
           seen.add(key);
 
+          console.log(`[observer] ${role}:`, text.slice(0, 120));
+
+          // For turns: buffer user; flush when assistant arrives
           if (role === "user") {
             turnRef.current = {
               id: String(Date.now()),
               userText: text,
               userTs: new Date().toISOString(),
             };
-          } else if (role === "assistant") {
-            sendTurnIfReady(text, { source: "dom", endpoint: "chatkit", method: "DOM" });
+          } else {
+            // assistant
+            const assistantTs = new Date().toISOString();
+            const payload = {
+              type: "turn",
+              id: turnRef.current?.id ?? String(Date.now()),
+              user_text: turnRef.current?.userText ?? "",
+              user_ts: turnRef.current?.userTs ?? "",
+              assistant_text: text,
+              assistant_ts: assistantTs,
+              meta: { path: location.pathname, source: "dom" },
+            };
+
+            void fetch("/api/log-event", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+
+            // reset for next turn
+            turnRef.current = null;
           }
         }
-      };
+      }
 
       // Initial sweep
-      scanNode(root);
+      scan(root);
 
-      // Observe future additions
+      // Observe for new messages
       const mo = new MutationObserver((mutations) => {
         for (const m of mutations) {
           if (m.addedNodes && m.addedNodes.length > 0) {
             m.addedNodes.forEach((n) => {
               if (n instanceof HTMLElement || n instanceof DocumentFragment) {
-                scanNode(n);
+                scan(n);
               }
             });
           }
           if (m.type === "childList" && m.target instanceof HTMLElement) {
-            scanNode(m.target);
+            scan(m.target);
           }
         }
       });
       mo.observe(root, { childList: true, subtree: true });
 
+      // Clean up
       return () => mo.disconnect();
-    };
+    }
 
-    // Try to attach immediately, then retry once if not yet present
+    // Find the custom element and attach. Retry once if it is not yet present.
     const host = document.querySelector("openai-chatkit") as HTMLElement | null;
     let cleanup: (() => void) | undefined;
 
     if (host) {
-      cleanup = attach(host);
+      cleanup = attachTo(host);
     } else {
+      console.log("[observer] host not ready, retrying…");
       const id = window.setTimeout(() => {
         const retry = document.querySelector("openai-chatkit") as HTMLElement | null;
-        if (retry) cleanup = attach(retry);
-      }, 600);
+        if (retry) cleanup = attachTo(retry);
+        else console.warn("[observer] openai-chatkit not found");
+      }, 700);
       return () => window.clearTimeout(id);
     }
 
     return () => {
       if (cleanup) cleanup();
     };
-  }, []); // once
+  }, []);
 
-  /* ------------------------------------------------------------------------ */
-
+// -------------------------------------------------------------------------- */
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
 
