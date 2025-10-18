@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/admin/compact",
+      "schedule": "0 2 * * *"
+    }
+  ]
+}
