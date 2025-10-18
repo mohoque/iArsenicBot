@@ -73,7 +73,7 @@ export function ChatKitPanel({
   );
   const [widgetInstanceKey, setWidgetInstanceKey] = useState(0);
 
-  // Buffer for one complete turn
+  // Buffer for a single user→assistant turn
   const turnRef = useRef<{
     id: string;
     userText?: string;
@@ -334,10 +334,10 @@ export function ChatKitPanel({
   });
 
   /* ------------------------------------------------------------------------ */
-  /* Helpers shared by interceptors                                           */
+  /* Helpers for interceptors and observer                                    */
   /* ------------------------------------------------------------------------ */
 
-  const extractUserText = (raw: string): string => {
+  const extractUserTextFromJSON = (raw: string): string => {
     try {
       const p = JSON.parse(raw) as Payload;
       if (typeof p?.input === "string") return p.input;
@@ -463,7 +463,7 @@ export function ChatKitPanel({
           // ignore
         }
 
-        const userText = requestBody ? extractUserText(requestBody) : "";
+        const userText = requestBody ? extractUserTextFromJSON(requestBody) : "";
         if (userText.trim().length > 0) {
           turnRef.current = {
             id: String(Date.now()),
@@ -574,81 +574,183 @@ export function ChatKitPanel({
   }, []); // once
 
   /* ------------------------------------------------------------------------ */
-  /* DOM Observer: robust logger (finds messages across ChatKit variants)     */
+  /* DOM Observer: event-driven + robust scanning (typed)                     */
   /* ------------------------------------------------------------------------ */
-  useEffect(() => {
-    if (typeof window === "undefined") return;
 
-    function attachTo(hostEl: HTMLElement) {
-      type WithShadow = HTMLElement & { shadowRoot?: ShadowRoot };
-      const root: ShadowRoot | null =
-        (hostEl as WithShadow).shadowRoot ?? null;
+  useEffect(() => {
+    if (!isBrowser) return;
+
+    type WithShadow = HTMLElement & { shadowRoot?: ShadowRoot };
+
+    // Register and remember cleanups
+    const cleanupFns: Array<() => void> = [];
+    const addCleanup = (fn: () => void) => cleanupFns.push(fn);
+
+      function attach(hostEl: HTMLElement) {
+        type WithShadow = HTMLElement & { shadowRoot?: ShadowRoot };
+        const root: ShadowRoot | null = (hostEl as WithShadow).shadowRoot ?? null;
+        if (!root) {
+          console.warn("[observer] shadowRoot not found on <openai-chatkit>");
+          return;
+        }
+
+        console.log("[observer] attached to shadowRoot");
+
+        // De-dupe keys we have already sent
+        const seen = new Set<string>();
+
+        // ----- helpers MUST come after 'root' is declared -----
+        const qs = <T extends Element>(sel: string, scope?: ParentNode): T | null =>
+          (((scope ?? root).querySelector(sel)) as T | null);
+
+        const getText = (
+          el: HTMLElement | HTMLTextAreaElement | HTMLInputElement | null
+        ): string => {
+          if (!el) return "";
+          if (el instanceof HTMLTextAreaElement) return el.value ?? "";
+          if (el instanceof HTMLInputElement) return el.value ?? "";
+          return el.innerText ?? "";
+        };
+
+        const extractVisible = (node: Element): string => {
+          const txt = (node as HTMLElement).innerText || node.textContent || "";
+          return txt.trim();
+        };
+
+        function inferRole(el: Element | null): "user" | "assistant" | "" {
+          for (let n: Element | null = el; n; n = n.parentElement) {
+            const dr = n.getAttribute?.("data-role") || n.getAttribute?.("data-message-role") || "";
+            if (dr === "user" || dr === "assistant") return dr as "user" | "assistant";
+
+            const cls = (n as HTMLElement).className || "";
+            if (/\bassistant\b/i.test(cls)) return "assistant";
+            if (/\buser\b/i.test(cls)) return "user";
+
+            const aria = n.getAttribute?.("aria-label") || n.getAttribute?.("role") || "";
+            if (/assistant/i.test(aria)) return "assistant";
+            if (/user|you/i.test(aria)) return "user";
+          }
+          return "";
+        }
+
+        // Locate transcript region
+        const transcript: ParentNode =
+          (qs<HTMLElement>('[role="log"]') as ParentNode) ??
+          (qs<HTMLElement>('[aria-live]') as ParentNode) ??
+          root;
+
+        // composer refs
+        let composerInput: HTMLTextAreaElement | HTMLInputElement | HTMLElement | null = null;
+        let composerSend: HTMLElement | null = null;
+
+        function hookComposer() {
+          const prevInput = composerInput;
+          const prevSend = composerSend;
+
+          composerInput =
+            qs<HTMLTextAreaElement>("textarea") ||
+            qs<HTMLElement>('[contenteditable="true"]') ||
+            qs<HTMLInputElement>('input[type="text"]');
+
+          if (!root) {
+            composerSend = null;
+            return;
+          }
+
+          composerSend =
+            Array.from(root.querySelectorAll<HTMLElement>("button, [role='button']"))
+              .find((b) => {
+                const label =
+                  b.getAttribute("aria-label") ||
+                  b.getAttribute("title") ||
+                  (b as HTMLButtonElement).innerText ||
+                  "";
+                return /send|submit/i.test(label);
+              }) || null;
+
+          if (prevInput === composerInput && prevSend === composerSend) return;
+
+          // Key handler: type as Event, cast inside
+          if (composerInput) {
+            const onKey = (ev: Event) => {
+              const e = ev as KeyboardEvent;
+              if (e.key === "Enter" && !e.shiftKey) {
+                const user = getText(composerInput).trim();
+                if (user) {
+                  console.log("[observer] user (enter):", user.slice(0, 120));
+                  turnRef.current = {
+                    id: String(Date.now()),
+                    userText: user,
+                    userTs: new Date().toISOString(),
+                  };
+                }
+              }
+            };
+            composerInput.addEventListener("keydown", onKey);
+            cleanupFns.push(() => composerInput?.removeEventListener("keydown", onKey));
+          }
+
+          if (composerSend) {
+            const onClick = () => {
+              const user = getText(composerInput).trim();
+              if (user) {
+                console.log("[observer] user (click):", user.slice(0, 120));
+                turnRef.current = {
+                  id: String(Date.now()),
+                  userText: user,
+                  userTs: new Date().toISOString(),
+                };
+              }
+            };
+            composerSend.addEventListener("click", onClick);
+            cleanupFns.push(() => composerSend?.removeEventListener("click", onClick));
+          }
+        }
+
       if (!root) {
-        console.warn("[observer] shadowRoot not found on <openai-chatkit>");
         return;
       }
 
-      console.log("[observer] attached to shadowRoot");
+      // ---- transcript scanning ---------------------------------------------
+      const transcriptEl =
+        root.querySelector<HTMLElement>('[role="log"]') ||
+        root.querySelector<HTMLElement>('[aria-live]') ||
+        ((root as unknown) as HTMLElement);
 
-      // A strong set to deduplicate lines we already sent
-      const seen = new Set<string>();
+      let lastAssistant = "";
 
-      // Try to infer role from attributes/classes on a node or its ancestors
-      function inferRole(el: Element | null): "user" | "assistant" | "" {
-        for (let n: Element | null = el; n; n = n.parentElement) {
-          const dr = n.getAttribute?.("data-role") || n.getAttribute?.("data-message-role") || "";
-          if (dr === "user" || dr === "assistant") return dr as "user" | "assistant";
-
-          const cls = (n as HTMLElement).className || "";
-          if (/\bassistant\b/i.test(cls)) return "assistant";
-          if (/\buser\b/i.test(cls)) return "user";
-
-          const aria = n.getAttribute?.("aria-label") || "";
-          if (/assistant/i.test(aria)) return "assistant";
-          if (/user/i.test(aria) || /you/i.test(aria)) return "user";
-        }
-        return "";
-      }
-
-      // Gather message-like nodes and emit turns
       function scan(container: ParentNode) {
-        const candidates = Array.from(
-          (container as Element).querySelectorAll<HTMLElement>(
-            [
-              // preferred data attributes (newer builds)
-              "[data-role]", "[data-message-role]",
-              // common containers in feeds
-              '[role="listitem"]', "article", "li",
-              // fallback to anything that looks like a message bubble
-              '[class*="message"]', '[class*="bubble"]'
-            ].join(",")
-          )
-        );
+        const selector = [
+          "[data-role]", "[data-message-role]",
+          '[role="listitem"]', "article", "li",
+          '[class*="message"]', '[class*="bubble"]', '[class*="content"]',
+          "p"
+        ].join(",");
 
-        for (const node of candidates) {
-          // Plain text view
-          const text = (node.innerText || "").trim();
+        const nodes = Array.from((container as Element).querySelectorAll<HTMLElement>(selector));
+        for (const el of nodes) {
+          const text = extractVisible(el);
           if (!text) continue;
 
-          const role = inferRole(node);
-          if (role !== "user" && role !== "assistant") continue;
+          const role = inferRole(el);
+          if (!role) continue;
 
-          // A stable dedupe key
           const key = `${role}:${text.slice(0, 240)}`;
           if (seen.has(key)) continue;
           seen.add(key);
 
-          console.log(`[observer] ${role}:`, text.slice(0, 120));
-
-          // For turns: buffer user; flush when assistant arrives
           if (role === "user") {
+            console.log("[observer] user:", text.slice(0, 120));
             turnRef.current = {
               id: String(Date.now()),
               userText: text,
               userTs: new Date().toISOString(),
             };
           } else {
-            // assistant
+            if (text === lastAssistant) continue;
+            lastAssistant = text;
+            console.log("[observer] assistant:", text.slice(0, 120));
+
             const assistantTs = new Date().toISOString();
             const payload = {
               type: "turn",
@@ -666,58 +768,66 @@ export function ChatKitPanel({
               body: JSON.stringify(payload),
             });
 
-            // reset for next turn
             turnRef.current = null;
           }
         }
       }
 
-      // Initial sweep
-      scan(root);
+      // Initial hooks and sweep
+      hookComposer();
+      scan(transcriptEl);
 
-      // Observe for new messages
+      // Observe transcript and composer for changes
       const mo = new MutationObserver((mutations) => {
         for (const m of mutations) {
-          if (m.addedNodes && m.addedNodes.length > 0) {
-            m.addedNodes.forEach((n) => {
-              if (n instanceof HTMLElement || n instanceof DocumentFragment) {
-                scan(n);
-              }
-            });
+          if (m.type === "childList") {
+            if (m.addedNodes && m.addedNodes.length > 0) {
+              m.addedNodes.forEach((n) => {
+                if (n instanceof HTMLElement || n instanceof DocumentFragment) {
+                  scan(n);
+                }
+              });
+            }
+            if (m.target instanceof HTMLElement) {
+              scan(m.target);
+            }
           }
-          if (m.type === "childList" && m.target instanceof HTMLElement) {
+          if (m.type === "attributes" && m.target instanceof HTMLElement) {
             scan(m.target);
           }
         }
       });
-      mo.observe(root, { childList: true, subtree: true });
+      mo.observe(transcriptEl, { childList: true, subtree: true, attributes: true });
+      addCleanup(() => mo.disconnect());
 
-      // Clean up
-      return () => mo.disconnect();
+      // As the UI can re-render, periodically try to re-hook composer if missing
+      const pollId = window.setInterval(() => {
+        if (!composerInput || !composerSend) hookComposer();
+      }, 1500);
+      addCleanup(() => window.clearInterval(pollId));
     }
 
-    // Find the custom element and attach. Retry once if it is not yet present.
+    // Find the custom element and attach; retry if needed
     const host = document.querySelector("openai-chatkit") as HTMLElement | null;
-    let cleanup: (() => void) | undefined;
-
     if (host) {
-      cleanup = attachTo(host);
+      attach(host);
     } else {
       console.log("[observer] host not ready, retrying…");
       const id = window.setTimeout(() => {
         const retry = document.querySelector("openai-chatkit") as HTMLElement | null;
-        if (retry) cleanup = attachTo(retry);
+        if (retry) attach(retry);
         else console.warn("[observer] openai-chatkit not found");
       }, 700);
-      return () => window.clearTimeout(id);
+      cleanupFns.push(() => window.clearTimeout(id));
     }
 
     return () => {
-      if (cleanup) cleanup();
+      cleanupFns.forEach((fn) => fn());
     };
-  }, []);
+  }, []); // once
 
-// -------------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
 
