@@ -13,6 +13,10 @@ import {
 import { ErrorOverlay } from "./ErrorOverlay";
 import type { ColorScheme } from "@/hooks/useColorScheme";
 
+/* -------------------------------------------------------------------------- */
+/* Types                                                                      */
+/* -------------------------------------------------------------------------- */
+
 export type FactAction = {
   type: "save";
   factId: string;
@@ -32,6 +36,13 @@ type ErrorState = {
   integration: string | null;
   retryable: boolean;
 };
+
+type TextPart = { type: "text"; text: string };
+type Role = "user" | "assistant" | "system" | "tool";
+type Message = { role: Role; content: string | TextPart[] };
+type Payload = { input?: string | Message[]; messages?: Message[] };
+
+/* -------------------------------------------------------------------------- */
 
 const isBrowser = typeof window !== "undefined";
 const isDev = process.env.NODE_ENV !== "production";
@@ -61,6 +72,13 @@ export function ChatKitPanel({
       : "pending"
   );
   const [widgetInstanceKey, setWidgetInstanceKey] = useState(0);
+
+  // Buffer for one complete turn
+  const turnRef = useRef<{
+    id: string;
+    userText?: string;
+    userTs?: string;
+  } | null>(null);
 
   const setErrorState = useCallback((updates: Partial<ErrorState>) => {
     setErrors((current) => ({ ...current, ...updates }));
@@ -315,66 +333,110 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ADDED: universal logging interceptor (fetch + beacon + XHR + WS, typed) ----------
+  /* ------------------------------------------------------------------------ */
+  /* Helpers shared by interceptors                                           */
+  /* ------------------------------------------------------------------------ */
+
+  const extractUserText = (raw: string): string => {
+    try {
+      const p = JSON.parse(raw) as Payload;
+      if (typeof p?.input === "string") return p.input;
+
+      if (Array.isArray(p?.input)) {
+        const u = p.input.find((m) => m && m.role === "user");
+        if (u) {
+          if (typeof u.content === "string") return u.content;
+          const t =
+            Array.isArray(u.content) &&
+            u.content.find((c) => c && (c as TextPart).type === "text");
+          if (t && typeof (t as TextPart).text === "string") return (t as TextPart).text;
+        }
+      }
+
+      if (Array.isArray(p?.messages)) {
+        const u = p.messages.find((m) => m && m.role === "user");
+        if (u) {
+          if (typeof u.content === "string") return u.content;
+          const t =
+            Array.isArray(u.content) &&
+            u.content.find((c) => c && (c as TextPart).type === "text");
+          if (t && typeof (t as TextPart).text === "string") return (t as TextPart).text;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return "";
+  };
+
+  const bodyToText = async (body: unknown): Promise<string> => {
+    try {
+      if (typeof body === "string") return body;
+      if (body instanceof Blob) return body.text();
+      if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
+      if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body.buffer as ArrayBuffer);
+    } catch {
+      // ignore
+    }
+    return "";
+  };
+
+  const shouldSkipUrl = (url: string): boolean => {
+    return (
+      url.includes("/api/create-session") ||
+      url.includes("/api/log-event") ||
+      url.includes("/track?") ||
+      url.includes("/_next/")
+    );
+  };
+
+  const sendTurnIfReady = (assistantText: string, meta: Record<string, string>) => {
+    if (!assistantText || assistantText.trim().length === 0) return;
+    const current = turnRef.current;
+    const assistantTs = new Date().toISOString();
+
+    const payload =
+      current
+        ? {
+            type: "turn",
+            id: current.id,
+            user_text: current.userText ?? "",
+            user_ts: current.userTs ?? "",
+            assistant_text: assistantText,
+            assistant_ts: assistantTs,
+            meta: { ...meta, path: location.pathname },
+          }
+        : {
+            type: "turn",
+            id: String(Date.now()),
+            user_text: "",
+            user_ts: "",
+            assistant_text: assistantText,
+            assistant_ts: assistantTs,
+            meta: { ...meta, path: location.pathname },
+          };
+
+    void fetch("/api/log-event", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    // Clear buffer for next turn
+    turnRef.current = null;
+  };
+
+  /* ------------------------------------------------------------------------ */
+  /* Interceptor: fetch (reads user BEFORE send; logs assistant AFTER)        */
+  /* ------------------------------------------------------------------------ */
+
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (!isBrowser) return;
 
     const originalFetch = window.fetch;
-    const originalBeacon = navigator.sendBeacon?.bind(navigator);
-    const originalXhrSend = XMLHttpRequest.prototype.send;
-    const originalXhrOpen = XMLHttpRequest.prototype.open;
-    const OriginalWS = window.WebSocket;
 
-    type TextPart = { type: "text"; text: string };
-    type Role = "user" | "assistant" | "system" | "tool";
-    type Message = { role: Role; content: string | TextPart[] };
-    type Payload = { input?: string | Message[]; messages?: Message[] };
-
-    function isRecord(v: unknown): v is Record<string, unknown> {
-      return typeof v === "object" && v !== null;
-    }
-    function isTextPartArray(v: unknown): v is TextPart[] {
-      return Array.isArray(v) &&
-        v.every(p => isRecord(p) && p["type"] === "text" && typeof p["text"] === "string");
-    }
-    function isMessage(v: unknown): v is Message {
-      return isRecord(v) &&
-        typeof v["role"] === "string" &&
-        (typeof v["content"] === "string" || isTextPartArray(v["content"]));
-    }
-    function firstUserText(messages?: Message[]): string {
-      if (!messages) return "";
-      const u = messages.find(m => m.role === "user");
-      if (!u) return "";
-      if (typeof u.content === "string") return u.content;
-      const t = u.content.find(p => p.type === "text");
-      return t ? t.text : "";
-    }
-    function extractUserText(raw: unknown): string {
-      const p = raw as Payload | null;
-      if (!p) return "";
-      if (typeof p.input === "string") return p.input;
-      if (Array.isArray(p.input) && p.input.every(isMessage)) return firstUserText(p.input);
-      if (Array.isArray(p.messages) && p.messages.every(isMessage)) return firstUserText(p.messages);
-      return "";
-    }
-
-    async function bodyToText(body: unknown): Promise<string> {
-      try {
-        if (typeof body === "string") return body;
-        if (body instanceof Blob) return body.text();
-        if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
-        if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body.buffer as ArrayBuffer);
-      } catch {}
-      return "";
-    }
-
-    console.log("[intercept] mounted");
-
-        // ---- fetch (log user turn BEFORE network; then parse assistant AFTER) ----
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      // Normalise URL and method
-      const asUrl = (v: RequestInfo | URL): string =>
+      const toUrl = (v: RequestInfo | URL): string =>
         typeof v === "string"
           ? v
           : v instanceof URL
@@ -383,124 +445,44 @@ export function ChatKitPanel({
           ? v.url
           : String(v);
 
-      const url = asUrl(input);
+      const url = toUrl(input);
       const method =
         (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-      // Skip noise
-      const shouldSkip =
-        url.includes("/api/create-session") ||
-        url.includes("/api/log-event") ||
-        url.includes("/track?") ||
-        url.includes("/_next/");
-
-      // ---------- 1) Read request body BEFORE sending ----------
+      // Read request body before sending
       let requestBody = "";
-      if (!shouldSkip && method === "POST") {
+      if (!shouldSkipUrl(url) && method === "POST") {
         try {
           if (input instanceof Request) {
-            // Clone so we can read without consuming the original
             const clone = input.clone();
             requestBody = await clone.text();
           } else if (init?.body !== undefined) {
-            // Convert any body into text safely
-            const toText = async (b: unknown): Promise<string> => {
-              try {
-                if (typeof b === "string") return b;
-                if (b instanceof Blob) return b.text();
-                if (b instanceof ArrayBuffer) return new TextDecoder().decode(b);
-                if (ArrayBuffer.isView(b)) return new TextDecoder().decode(b.buffer as ArrayBuffer);
-              } catch {}
-              return "";
-            };
-            requestBody = await toText(init.body);
-          }
-        } catch {
-          // best effort
-        }
-      }
-
-      // Try to extract a user message from common payload shapes
-      type TextPart = { type: "text"; text: string };
-      type Role = "user" | "assistant" | "system" | "tool";
-      type Message = { role: Role; content: string | TextPart[] };
-      type Payload = { input?: string | Message[]; messages?: Message[] };
-
-      const getUserText = (raw: string): string => {
-        try {
-          const p = JSON.parse(raw) as Payload;
-          if (typeof p?.input === "string") return p.input;
-          if (Array.isArray(p?.input)) {
-            const u = p.input.find(m => m && m.role === "user");
-            if (!u) return "";
-            if (typeof u.content === "string") return u.content;
-            const t = Array.isArray(u.content)
-              ? u.content.find(c => c && (c as TextPart).type === "text")
-              : null;
-            return t && typeof (t as TextPart).text === "string" ? (t as TextPart).text : "";
-          }
-          if (Array.isArray(p?.messages)) {
-            const u = p.messages.find(m => m && m.role === "user");
-            if (!u) return "";
-            if (typeof u.content === "string") return u.content;
-            const t = Array.isArray(u.content)
-              ? u.content.find(c => c && (c as TextPart).type === "text")
-              : null;
-            return t && typeof (t as TextPart).text === "string" ? (t as TextPart).text : "";
+            requestBody = await bodyToText(init.body);
           }
         } catch {
           // ignore
         }
-        return "";
-      };
 
-      const userText = requestBody ? getUserText(requestBody) : "";
-
-      if (!shouldSkip && method === "POST" && userText.trim().length > 0) {
-        // Fire and forget user log
-        void fetch("/api/log-event", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            role: "user",
-            text: userText,
-            meta: { path: location.pathname, endpoint: url.replace(/^https?:\/\//, ""), method }
-          })
-        });
-        // Optional console to verify once
-        // console.log("[intercept] user ->", userText.slice(0, 120));
+        const userText = requestBody ? extractUserText(requestBody) : "";
+        if (userText.trim().length > 0) {
+          turnRef.current = {
+            id: String(Date.now()),
+            userText,
+            userTs: new Date().toISOString(),
+          };
+        }
       }
 
-      // ---------- 2) Send the real request ----------
+      // Send the real request
       const resp = await originalFetch(input as RequestInfo, init as RequestInit);
 
-      // ---------- 3) Parse assistant reply AFTER receiving ----------
+      // Parse assistant afterwards
       try {
-        if (!shouldSkip && method === "POST") {
+        if (!shouldSkipUrl(url) && method === "POST") {
           const ct = resp.headers.get("content-type") ?? "";
           const looksStream = ct.includes("text/event-stream");
 
-          const logAssistant = async (text: string, mode: string) => {
-            if (text.trim().length === 0) return;
-            void fetch("/api/log-event", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                role: "assistant",
-                text,
-                meta: {
-                  path: location.pathname,
-                  endpoint: url.replace(/^https?:\/\//, ""),
-                  method: mode
-                }
-              })
-            });
-            // Optional console
-            // console.log("[intercept] assistant ->", text.slice(0, 120));
-          };
-
           if (looksStream) {
-            // Streamed SSE
             const cloned = resp.clone();
             const reader = cloned.body?.getReader();
             if (reader) {
@@ -508,20 +490,30 @@ export function ChatKitPanel({
               let buffer = "";
               let full = "";
 
-              const pickText = (line: string): string => {
+              const pullFromLine = (line: string): string => {
                 const i = line.indexOf("{");
                 if (i < 0) return "";
                 try {
-                  const obj = JSON.parse(line.slice(i));
-                  const ot = (obj as { output_text?: unknown }).output_text;
+                  const obj = JSON.parse(line.slice(i)) as Record<string, unknown>;
+                  const ot = obj["output_text"];
                   if (typeof ot === "string") return ot;
-                  if (Array.isArray(ot) && ot.every(v => typeof v === "string")) return (ot as string[]).join("");
-                  const delta =
-                    (obj as { delta?: unknown }).delta ??
-                    (obj as { event?: unknown; text?: unknown }).text;
-                  if (typeof delta === "string") return delta;
-                  if (typeof (obj as { text?: unknown }).text === "string") return String((obj as { text?: unknown }).text);
-                } catch {}
+                  if (Array.isArray(ot) && ot.every((v) => typeof v === "string")) {
+                    return (ot as string[]).join("");
+                  }
+                  const delta = (obj as { delta?: unknown }).delta;
+                  if (
+                    delta &&
+                    typeof delta === "object" &&
+                    typeof (delta as { text?: unknown }).text === "string"
+                  ) {
+                    return String((delta as { text: string }).text);
+                  }
+                  if (typeof (obj as { text?: unknown }).text === "string") {
+                    return String((obj as { text: string }).text);
+                  }
+                } catch {
+                  // ignore
+                }
                 return "";
               };
 
@@ -534,176 +526,142 @@ export function ChatKitPanel({
                 for (const line of lines) {
                   const t = line.trim();
                   if (!t.startsWith("data:")) continue;
-                  const piece = pickText(t);
+                  const piece = pullFromLine(t);
                   if (piece) full += piece;
                 }
               }
               if (buffer.startsWith("data:")) {
-                const tail = pickText(buffer);
+                const tail = pullFromLine(buffer);
                 if (tail) full += tail;
               }
 
-              await logAssistant(full, "STREAM:SSE");
+              sendTurnIfReady(full, {
+                endpoint: url.replace(/^https?:\/\//, ""),
+                method: "STREAM:SSE",
+              });
             }
           } else {
-            // Non-streaming JSON or text
-            const cloned = resp.clone();
-            const raw = await cloned.text();
-            let out = "";
+            const clone = resp.clone();
+            const raw = await clone.text();
+            let assistant = "";
             try {
               const obj = JSON.parse(raw) as Record<string, unknown>;
               const ot = obj["output_text"];
-              if (typeof ot === "string") out = ot;
-              else if (Array.isArray(ot) && ot.every(v => typeof v === "string")) out = (ot as string[]).join("");
+              if (typeof ot === "string") assistant = ot;
+              else if (Array.isArray(ot) && ot.every((v) => typeof v === "string")) {
+                assistant = (ot as string[]).join("");
+              }
             } catch {
-              if (typeof raw === "string") out = raw;
+              if (typeof raw === "string") assistant = raw;
             }
-            await logAssistant(out, "POST:nonstream");
+
+            sendTurnIfReady(assistant, {
+              endpoint: url.replace(/^https?:\/\//, ""),
+              method: "POST:nonstream",
+            });
           }
         }
       } catch {
-        // do not block app
+        // ignore
       }
 
       return resp;
     };
 
-
-
-    // ---- sendBeacon ----
-    if (originalBeacon) {
-      navigator.sendBeacon = (url: string | URL, data?: BodyInit | null): boolean => {
-        try {
-          const href = typeof url === "string" ? url : url.toString();
-          if (!href.includes("/api/log-event")) {
-            (async () => {
-              const text = await bodyToText(data ?? "");
-              let parsed: unknown = null;
-              try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
-              const userText = extractUserText(parsed);
-
-              void fetch("/api/log-event", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                  role: "user",
-                  text: userText || "",
-                  meta: {
-                    path: location.pathname,
-                    endpoint: href.replace(/^https?:\/\//, ""),
-                    method: "BEACON",
-                    bodySample: text.slice(0, 300)
-                  }
-                })
-              });
-
-              console.log("[intercept] POST(beacon) ->", href, "| userText:", (userText || "").slice(0, 120));
-            })();
-          }
-        } catch {}
-        return originalBeacon(url, data);
-      };
-    }
-
-    // ---- XHR ----
-    XMLHttpRequest.prototype.open = function open(
-      method: string,
-      url: string | URL,
-      async?: boolean,
-      username?: string | null,
-      password?: string | null
-    ): void {
-      const self = this as XMLHttpRequest & { __url?: string; __method?: string };
-      self.__url = typeof url === "string" ? url : url.toString();
-      self.__method = (method || "GET").toUpperCase();
-      return originalXhrOpen.call(this, method, url, async ?? true, username ?? null, password ?? null);
-    };
-
-    XMLHttpRequest.prototype.send = function send(
-      body?: Document | XMLHttpRequestBodyInit | null
-    ): void {
-      try {
-        const self = this as XMLHttpRequest & { __url?: string; __method?: string };
-        const url = self.__url ?? this.responseURL;
-        const method = self.__method ?? "POST";
-        if (method === "POST" && url && !url.includes("/api/log-event")) {
-          (async () => {
-            const text = await bodyToText(body ?? "");
-            let parsed: unknown = null;
-            try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
-            const userText = extractUserText(parsed);
-
-            void fetch("/api/log-event", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                role: "user",
-                text: userText || "",
-                meta: {
-                  path: location.pathname,
-                  endpoint: url.replace(/^https?:\/\//, ""),
-                  method: "XHR",
-                  bodySample: text.slice(0, 300)
-                }
-              })
-            });
-
-            console.log("[intercept] POST(xhr) ->", url, "| userText:", (userText || "").slice(0, 120));
-          })();
-        }
-      } catch {}
-      return originalXhrSend.call(this, body as Document | XMLHttpRequestBodyInit | null);
-    };
-
-    // ---- WebSocket ----
-    class LoggedWS extends OriginalWS {
-      constructor(url: string | URL, protocols?: string | string[]) {
-        super(url, protocols);
-        const u = typeof url === "string" ? url : url.toString();
-        console.log("[intercept] WebSocket open ->", u);
-      }
-      send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
-        try {
-          const sample =
-            typeof data === "string"
-              ? data.slice(0, 300)
-              : data instanceof Blob
-              ? "(blob)"
-              : ArrayBuffer.isView(data)
-              ? "(arraybuffer view)"
-              : "(arraybuffer)";
-          void fetch("/api/log-event", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              role: "user",
-              text: "",
-              meta: {
-                path: location.pathname,
-                endpoint: "WebSocket",
-                method: "WS",
-                bodySample: sample
-              }
-            })
-          });
-          console.log("[intercept] POST(ws) -> sample:", sample);
-        } catch {}
-        return super.send(data);
-      }
-    }
-    window.WebSocket = LoggedWS as unknown as typeof WebSocket;
-
     return () => {
       window.fetch = originalFetch;
-      if (originalBeacon) navigator.sendBeacon = originalBeacon;
-      XMLHttpRequest.prototype.send = originalXhrSend;
-      XMLHttpRequest.prototype.open = originalXhrOpen;
-      window.WebSocket = OriginalWS as unknown as typeof WebSocket;
     };
-  }, []);
-  // ---------- END ADDED ----------
+  }, []); // once
 
+  /* ------------------------------------------------------------------------ */
+  /* DOM Observer: logs turns by watching rendered messages                   */
+  /* ------------------------------------------------------------------------ */
 
+  useEffect(() => {
+    if (!isBrowser) return;
+
+    const attach = (hostEl: HTMLElement) => {
+      const root: ShadowRoot | null =
+        (hostEl as unknown as { shadowRoot?: ShadowRoot }).shadowRoot ?? null;
+      if (!root) return;
+
+      // Track which text fragments we have handled to avoid duplicates
+      const seen = new Set<string>();
+
+      const scanNode = (container: ParentNode) => {
+        const elements = Array.from(
+          (container as Element).querySelectorAll<HTMLElement>(
+            "[data-role],[data-message-role]"
+          )
+        );
+
+        for (const el of elements) {
+          const roleAttr =
+            el.getAttribute("data-role") ?? el.getAttribute("data-message-role") ?? "";
+          const role = roleAttr === "user" || roleAttr === "assistant" ? roleAttr : "";
+
+          const text = (el.innerText || "").trim();
+          if (!role || !text) continue;
+
+          const key = `${role}:${text.slice(0, 200)}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          if (role === "user") {
+            turnRef.current = {
+              id: String(Date.now()),
+              userText: text,
+              userTs: new Date().toISOString(),
+            };
+          } else if (role === "assistant") {
+            sendTurnIfReady(text, { source: "dom", endpoint: "chatkit", method: "DOM" });
+          }
+        }
+      };
+
+      // Initial sweep
+      scanNode(root);
+
+      // Observe future additions
+      const mo = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.addedNodes && m.addedNodes.length > 0) {
+            m.addedNodes.forEach((n) => {
+              if (n instanceof HTMLElement || n instanceof DocumentFragment) {
+                scanNode(n);
+              }
+            });
+          }
+          if (m.type === "childList" && m.target instanceof HTMLElement) {
+            scanNode(m.target);
+          }
+        }
+      });
+      mo.observe(root, { childList: true, subtree: true });
+
+      return () => mo.disconnect();
+    };
+
+    // Try to attach immediately, then retry once if not yet present
+    const host = document.querySelector("openai-chatkit") as HTMLElement | null;
+    let cleanup: (() => void) | undefined;
+
+    if (host) {
+      cleanup = attach(host);
+    } else {
+      const id = window.setTimeout(() => {
+        const retry = document.querySelector("openai-chatkit") as HTMLElement | null;
+        if (retry) cleanup = attach(retry);
+      }, 600);
+      return () => window.clearTimeout(id);
+    }
+
+    return () => {
+      if (cleanup) cleanup();
+    };
+  }, []); // once
+
+  /* ------------------------------------------------------------------------ */
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
@@ -732,9 +690,7 @@ export function ChatKitPanel({
       <ErrorOverlay
         error={blockingError}
         fallbackMessage={
-          blockingError || !isInitializingSession
-            ? null
-            : "Loading assistant session..."
+          blockingError || !isInitializingSession ? null : "Loading assistant session..."
         }
         onRetry={blockingError && errors.retryable ? handleResetChat : null}
         retryLabel="Restart chat"
@@ -742,6 +698,10 @@ export function ChatKitPanel({
     </div>
   );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Error detail helper                                                        */
+/* -------------------------------------------------------------------------- */
 
 function extractErrorDetail(
   payload: Record<string, unknown> | undefined,
@@ -752,7 +712,12 @@ function extractErrorDetail(
   const error = payload.error;
   if (typeof error === "string") return error;
 
-  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
     return (error as { message: string }).message;
   }
 
@@ -762,7 +727,12 @@ function extractErrorDetail(
   if (details && typeof details === "object" && "error" in details) {
     const nestedError = (details as { error?: unknown }).error;
     if (typeof nestedError === "string") return nestedError;
-    if (nestedError && typeof nestedError === "object" && "message" in nestedError && typeof (nestedError as { message?: unknown }).message === "string") {
+    if (
+      nestedError &&
+      typeof nestedError === "object" &&
+      "message" in nestedError &&
+      typeof (nestedError as { message?: unknown }).message === "string"
+    ) {
       return (nestedError as { message: string }).message;
     }
   }

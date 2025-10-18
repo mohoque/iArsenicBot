@@ -1,50 +1,61 @@
-export const runtime = 'edge';
+export const runtime = "edge";
 
-import { NextRequest, NextResponse } from 'next/server';
-import { put } from '@vercel/blob';
+import { NextResponse } from "next/server";
+import { put } from "@vercel/blob";
 
-function cap(v: unknown, n: number) {
-  return String(v ?? '').slice(0, n);
-}
-function tsParts(d = new Date()) {
-  const p = (x: number, w = 2) => x.toString().padStart(w, '0');
-  return {
-    day: `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}`,
-    time: `${p(d.getUTCHours())}-${p(d.getUTCMinutes())}-${p(d.getUTCSeconds())}-${p(d.getUTCMilliseconds(),3)}`
-  };
-}
-
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
-    const body = await req.json();
+    const ua = req.headers.get("user-agent") || "";
+    const ts = new Date().toISOString();
+    const body = await req.json().catch(() => ({}));
 
-    const record = {
-      ts: new Date().toISOString(),
-      role: cap(body.role, 20),
-      text: cap(body.text, 4000),
-      len: typeof body.text === 'string' ? body.text.length : 0,
-      sessionId: cap(body.sessionId, 200),
-      threadId: cap(body.threadId, 200),
-      meta: body.meta ?? {},
-      ua: cap(req.headers.get('user-agent'), 400)
-    };
+    // Normalise to one record
+    let record: Record<string, unknown>;
 
-    const { day, time } = tsParts();
-    const key = `logs/${day}/${time}.json`;
+    if (body?.type === "turn") {
+      record = {
+        ts,                           // server time
+        type: "turn",
+        id: String(body.id || ""),
+        user_text: String(body.user_text || ""),
+        user_ts: String(body.user_ts || ""),
+        assistant_text: String(body.assistant_text || ""),
+        assistant_ts: String(body.assistant_ts || ""),
+        meta: body.meta ?? {},
+        ua,
+      };
+    } else {
+      // Backwards compatibility: single-sided event
+      const text = String(body.text || "");
+      const role = String(body.role || "user");
+      record = {
+        ts,
+        role,
+        text,
+        len: text.length,
+        sessionId: String(body.sessionId || ""),
+        threadId: String(body.threadId || ""),
+        meta: body.meta ?? {},
+        ua,
+      };
+    }
+
+    // One file per turn. Keyed by date and time.
+    const day = ts.slice(0, 10);
+    const time = ts.slice(11, 23).replace(/[:.]/g, "-");
+    const suffix = body?.type === "turn" ? ".turn.json" : ".json";
+    const key = `logs/${day}/${time}${suffix}`;
 
     await put(key, JSON.stringify(record), {
-      access: 'public',                      // must be public on Blob
+      access: "public",
       addRandomSuffix: false,
-      contentType: 'application/json',
-      token: process.env.BLOB_READ_WRITE_TOKEN
+      contentType: "application/json",
+      token: process.env.BLOB_READ_WRITE_TOKEN,
     });
-
-    // Optional echo for quick checks
-    console.log('[log-event]', record.role, record.text.slice(0, 80));
 
     return NextResponse.json({ ok: true, key });
   } catch (err) {
-    console.error('[log-event] error', err);
-    return NextResponse.json({ ok: false, error: String(err) }, { status: 400 });
+    console.error("[log-event] error", err);
+    return NextResponse.json({ ok: false, error: "bad_request" }, { status: 400 });
   }
 }
