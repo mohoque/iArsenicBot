@@ -7,15 +7,15 @@ export const CREATE_SESSION_ENDPOINT = "/api/create-session";
 
 export const STARTER_PROMPTS: StartScreenPrompt[] = [
   {
-    label: "What can you do?",
-    prompt: "What can you do?",
+    label: "পানির বিষয়ে কিছু জানতে চান?",
+    prompt: "How can you help with my drinking water?",
     icon: "circle-question",
   },
 ];
 
 export const PLACEHOLDER_INPUT = "Ask anything...";
 
-export const GREETING = "How can I help you today?";
+export const GREETING = "💧 স্বাগতম! আমি বাংলাদেশের পানীয় জল, নলকূপ ও আর্সেনিক ঝুঁকি নিয়ে তথ্য দিই।";
 
 export const getThemeConfig = (theme: ColorScheme): ThemeOption => ({
   color: {

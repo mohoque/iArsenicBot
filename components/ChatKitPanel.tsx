@@ -193,10 +193,7 @@ export function ChatKitPanel({
           body: JSON.stringify({
             workflow: { id: WORKFLOW_ID },
             chatkit_configuration: {
-              // enable attachments
-              file_upload: {
-                enabled: true,
-              },
+              file_upload: { enabled: true },
             },
           }),
         });
@@ -216,10 +213,7 @@ export function ChatKitPanel({
           try {
             data = JSON.parse(raw) as Record<string, unknown>;
           } catch (parseError) {
-            console.error(
-              "Failed to parse create-session response",
-              parseError
-            );
+            console.error("Failed to parse create-session response", parseError);
           }
         }
 
@@ -273,14 +267,9 @@ export function ChatKitPanel({
     },
     composer: {
       placeholder: PLACEHOLDER_INPUT,
-      attachments: {
-        // Enable attachments
-        enabled: true,
-      },
+      attachments: { enabled: true },
     },
-    threadItemActions: {
-      feedback: false,
-    },
+    threadItemActions: { feedback: false },
     onClientTool: async (invocation: {
       name: string;
       params: Record<string, unknown>;
@@ -288,9 +277,7 @@ export function ChatKitPanel({
       if (invocation.name === "switch_theme") {
         const requested = invocation.params.theme;
         if (requested === "light" || requested === "dark") {
-          if (isDev) {
-            console.debug("[ChatKitPanel] switch_theme", requested);
-          }
+          if (isDev) console.debug("[ChatKitPanel] switch_theme", requested);
           onThemeRequest(requested);
           return { success: true };
         }
@@ -324,11 +311,130 @@ export function ChatKitPanel({
       processedFacts.current.clear();
     },
     onError: ({ error }: { error: unknown }) => {
-      // Note that Chatkit UI handles errors for your users.
-      // Thus, your app code doesn't need to display errors on UI.
       console.error("ChatKit error", error);
     },
   });
+
+    // ---------- ROBUST INTERCEPTOR: capture user turns and log them ----------
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const originalFetch = window.fetch;
+
+    function extractUserText(json: any): string {
+      // Shape 1: { input: "..." }
+      if (typeof json?.input === "string") return json.input;
+
+      // Shape 2: { input: [ {role:"user", content:[{type:"text", text:"..."}]} ] }
+      if (Array.isArray(json?.input)) {
+        const u = json.input.find((x: any) => x?.role === "user");
+        if (u?.content) {
+          if (typeof u.content === "string") return u.content;
+          if (Array.isArray(u.content)) {
+            const t = u.content.find((c: any) => c?.type === "text")?.text;
+            if (typeof t === "string") return t;
+          }
+        }
+      }
+
+      // Shape 3: { messages: [ {role:"user", content:"..."} ] }
+      if (Array.isArray(json?.messages)) {
+        const u = json.messages.find((m: any) => m?.role === "user");
+        if (u?.content) {
+          if (typeof u.content === "string") return u.content;
+          if (Array.isArray(u.content)) {
+            const t = u.content.find((c: any) => c?.type === "text")?.text;
+            if (typeof t === "string") return t;
+          }
+        }
+      }
+      return "";
+    }
+
+    async function readBodySafely(input: RequestInfo | URL, init?: RequestInit) {
+      // Try Request instance first
+      if (input instanceof Request) {
+        try {
+          const clone = input.clone();
+          const text = await clone.text();
+          if (text) return JSON.parse(text);
+        } catch {}
+      }
+      // Then handle init.body variants
+      if (init?.body) {
+        try {
+          if (typeof init.body === "string") return JSON.parse(init.body);
+          if (init.body instanceof Blob) {
+            const t = await (init.body as Blob).text();
+            return JSON.parse(t);
+          }
+          // If it is a ReadableStream, skip to avoid consuming it
+        } catch {}
+      }
+      return null;
+    }
+
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      try {
+        const urlStr =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+            ? input.toString()
+            : input instanceof Request
+            ? input.url
+            : String(input);
+
+        const method =
+          (init?.method ??
+            (input instanceof Request ? input.method : "GET")).toUpperCase();
+
+        // Intercept any OpenAI POST that likely carries a user turn
+        if (
+          method === "POST" &&
+          /api\.openai\.com\/v1\/(responses|agent-responses|chat\/completions)/.test(
+            urlStr
+          )
+        ) {
+          const json = await readBodySafely(input, init);
+          const userText = extractUserText(json);
+
+          if (userText) {
+            console.log(
+              "[intercept] POST →",
+              urlStr,
+              "| userText:",
+              userText.slice(0, 120)
+            );
+
+            // Fire-and-forget so we never block the chat
+            void fetch("/api/log-event", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                role: "user",
+                text: userText,
+                meta: {
+                  path: location.pathname,
+                  endpoint: urlStr.replace(/^https?:\/\//, ""),
+                },
+              }),
+            });
+          }
+        }
+      } catch {
+        // swallow errors; never break the original call
+      }
+
+      return originalFetch(input as any, init as any);
+    };
+
+    return () => {
+      window.fetch = originalFetch;
+    };
+  }, []);
+  // ---------- END ROBUST INTERCEPTOR ----------
+
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
@@ -372,47 +478,27 @@ function extractErrorDetail(
   payload: Record<string, unknown> | undefined,
   fallback: string
 ): string {
-  if (!payload) {
-    return fallback;
-  }
+  if (!payload) return fallback;
 
   const error = payload.error;
-  if (typeof error === "string") {
-    return error;
-  }
+  if (typeof error === "string") return error;
 
-  if (
-    error &&
-    typeof error === "object" &&
-    "message" in error &&
-    typeof (error as { message?: unknown }).message === "string"
-  ) {
+  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
     return (error as { message: string }).message;
   }
 
   const details = payload.details;
-  if (typeof details === "string") {
-    return details;
-  }
+  if (typeof details === "string") return details;
 
   if (details && typeof details === "object" && "error" in details) {
     const nestedError = (details as { error?: unknown }).error;
-    if (typeof nestedError === "string") {
-      return nestedError;
-    }
-    if (
-      nestedError &&
-      typeof nestedError === "object" &&
-      "message" in nestedError &&
-      typeof (nestedError as { message?: unknown }).message === "string"
-    ) {
+    if (typeof nestedError === "string") return nestedError;
+    if (nestedError && typeof nestedError === "object" && "message" in nestedError && typeof (nestedError as { message?: unknown }).message === "string") {
       return (nestedError as { message: string }).message;
     }
   }
 
-  if (typeof payload.message === "string") {
-    return payload.message;
-  }
+  if (typeof payload.message === "string") return payload.message;
 
   return fallback;
 }
