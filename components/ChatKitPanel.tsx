@@ -371,9 +371,9 @@ export function ChatKitPanel({
 
     console.log("[intercept] mounted");
 
-        // ---- fetch (logs user turn + parses streamed assistant reply) ----
+        // ---- fetch (log user turn BEFORE network; then parse assistant AFTER) ----
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      // Helper: decide if this request is a chat request we care about
+      // Normalise URL and method
       const asUrl = (v: RequestInfo | URL): string =>
         typeof v === "string"
           ? v
@@ -384,228 +384,190 @@ export function ChatKitPanel({
           : String(v);
 
       const url = asUrl(input);
-      const method = (
-        init?.method ?? (input instanceof Request ? input.method : "GET")
-      ).toUpperCase();
+      const method =
+        (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-      // Skip bootstrap, our own logger, and framework noise
+      // Skip noise
       const shouldSkip =
         url.includes("/api/create-session") ||
         url.includes("/api/log-event") ||
         url.includes("/track?") ||
         url.includes("/_next/");
 
-      // Send the real network request
-      const resp = await originalFetch(input as RequestInfo, init as RequestInit);
-
-      try {
-        if (!shouldSkip && method === "POST") {
-          // ---------- 1) Best-effort USER text ----------
-          let requestBody = "";
+      // ---------- 1) Read request body BEFORE sending ----------
+      let requestBody = "";
+      if (!shouldSkip && method === "POST") {
+        try {
           if (input instanceof Request) {
+            // Clone so we can read without consuming the original
             const clone = input.clone();
             requestBody = await clone.text();
           } else if (init?.body !== undefined) {
-            requestBody = await bodyToText(init.body);
+            // Convert any body into text safely
+            const toText = async (b: unknown): Promise<string> => {
+              try {
+                if (typeof b === "string") return b;
+                if (b instanceof Blob) return b.text();
+                if (b instanceof ArrayBuffer) return new TextDecoder().decode(b);
+                if (ArrayBuffer.isView(b)) return new TextDecoder().decode(b.buffer as ArrayBuffer);
+              } catch {}
+              return "";
+            };
+            requestBody = await toText(init.body);
           }
+        } catch {
+          // best effort
+        }
+      }
 
-          // Parse common shapes
-          type TextPart = { type: "text"; text: string };
-          type Role = "user" | "assistant" | "system" | "tool";
-          type Message = { role: Role; content: string | TextPart[] };
-          type Payload = { input?: string | Message[]; messages?: Message[] };
+      // Try to extract a user message from common payload shapes
+      type TextPart = { type: "text"; text: string };
+      type Role = "user" | "assistant" | "system" | "tool";
+      type Message = { role: Role; content: string | TextPart[] };
+      type Payload = { input?: string | Message[]; messages?: Message[] };
 
-          const getUserText = (raw: string): string => {
-            try {
-              const p = JSON.parse(raw) as Payload;
-              if (typeof p?.input === "string") return p.input;
-              if (Array.isArray(p?.input)) {
-                const u = p.input.find(m => m && m.role === "user");
-                if (!u) return "";
-                if (typeof u.content === "string") return u.content;
-                const t = Array.isArray(u.content)
-                  ? u.content.find(c => c && (c as TextPart).type === "text")
-                  : null;
-                return t && typeof (t as TextPart).text === "string"
-                  ? (t as TextPart).text
-                  : "";
-              }
-              if (Array.isArray(p?.messages)) {
-                const u = p.messages.find(m => m && m.role === "user");
-                if (!u) return "";
-                if (typeof u.content === "string") return u.content;
-                const t = Array.isArray(u.content)
-                  ? u.content.find(c => c && (c as TextPart).type === "text")
-                  : null;
-                return t && typeof (t as TextPart).text === "string"
-                  ? (t as TextPart).text
-                  : "";
-              }
-            } catch {
-              // ignore
-            }
-            return "";
-          };
+      const getUserText = (raw: string): string => {
+        try {
+          const p = JSON.parse(raw) as Payload;
+          if (typeof p?.input === "string") return p.input;
+          if (Array.isArray(p?.input)) {
+            const u = p.input.find(m => m && m.role === "user");
+            if (!u) return "";
+            if (typeof u.content === "string") return u.content;
+            const t = Array.isArray(u.content)
+              ? u.content.find(c => c && (c as TextPart).type === "text")
+              : null;
+            return t && typeof (t as TextPart).text === "string" ? (t as TextPart).text : "";
+          }
+          if (Array.isArray(p?.messages)) {
+            const u = p.messages.find(m => m && m.role === "user");
+            if (!u) return "";
+            if (typeof u.content === "string") return u.content;
+            const t = Array.isArray(u.content)
+              ? u.content.find(c => c && (c as TextPart).type === "text")
+              : null;
+            return t && typeof (t as TextPart).text === "string" ? (t as TextPart).text : "";
+          }
+        } catch {
+          // ignore
+        }
+        return "";
+      };
 
-          const userText = requestBody ? getUserText(requestBody) : "";
+      const userText = requestBody ? getUserText(requestBody) : "";
 
-          if (userText.trim().length > 0) {
+      if (!shouldSkip && method === "POST" && userText.trim().length > 0) {
+        // Fire and forget user log
+        void fetch("/api/log-event", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            role: "user",
+            text: userText,
+            meta: { path: location.pathname, endpoint: url.replace(/^https?:\/\//, ""), method }
+          })
+        });
+        // Optional console to verify once
+        // console.log("[intercept] user ->", userText.slice(0, 120));
+      }
+
+      // ---------- 2) Send the real request ----------
+      const resp = await originalFetch(input as RequestInfo, init as RequestInit);
+
+      // ---------- 3) Parse assistant reply AFTER receiving ----------
+      try {
+        if (!shouldSkip && method === "POST") {
+          const ct = resp.headers.get("content-type") ?? "";
+          const looksStream = ct.includes("text/event-stream");
+
+          const logAssistant = async (text: string, mode: string) => {
+            if (text.trim().length === 0) return;
             void fetch("/api/log-event", {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
-                role: "user",
-                text: userText,
+                role: "assistant",
+                text,
                 meta: {
                   path: location.pathname,
                   endpoint: url.replace(/^https?:\/\//, ""),
-                  method,
-                },
-              }),
+                  method: mode
+                }
+              })
             });
-          }
+            // Optional console
+            // console.log("[intercept] assistant ->", text.slice(0, 120));
+          };
 
-          // ---------- 2) Stream-parse ASSISTANT text ----------
-          // We clone the response, read the stream, and accumulate plain text.
-          // This supports OpenAI Responses SSE lines containing JSON with fields like:
-          // - "output_text": "..."
-          // - or incremental "delta": { "type":"output_text.delta", "text":"..." }
-          const ct = resp.headers.get("content-type") ?? "";
-          const looksStream = ct.includes("text/event-stream");
-
-          const accumulateAssistant = async (): Promise<void> => {
-            try {
-              const cloned = resp.clone();
-              const reader = cloned.body?.getReader();
-              if (!reader) return;
-
+          if (looksStream) {
+            // Streamed SSE
+            const cloned = resp.clone();
+            const reader = cloned.body?.getReader();
+            if (reader) {
               const decoder = new TextDecoder();
               let buffer = "";
               let full = "";
 
-              // tolerant extractors
-              const pullTextFromLine = (line: string): string => {
-                // Lines usually start with "data: {json...}"
+              const pickText = (line: string): string => {
                 const i = line.indexOf("{");
                 if (i < 0) return "";
                 try {
                   const obj = JSON.parse(line.slice(i));
-                  // 1) direct full text
                   const ot = (obj as { output_text?: unknown }).output_text;
                   if (typeof ot === "string") return ot;
-
-                  // 2) aggregated array of output_text
-                  if (Array.isArray(ot) && ot.every(v => typeof v === "string")) {
-                    return (ot as string[]).join("");
-                  }
-
-                  // 3) delta events
+                  if (Array.isArray(ot) && ot.every(v => typeof v === "string")) return (ot as string[]).join("");
                   const delta =
                     (obj as { delta?: unknown }).delta ??
                     (obj as { event?: unknown; text?: unknown }).text;
                   if (typeof delta === "string") return delta;
-
-                  if (isRecord(obj) && typeof (obj as { text?: unknown }).text === "string") {
-                    return String((obj as { text?: unknown }).text);
-                  }
-                } catch {
-                  // ignore parse errors per line
-                }
+                  if (typeof (obj as { text?: unknown }).text === "string") return String((obj as { text?: unknown }).text);
+                } catch {}
                 return "";
               };
 
-              // stream loop
               for (;;) {
-                const res = await reader.read();
-                if (res.done) break;
-                buffer += decoder.decode(res.value, { stream: true });
-
-                // split safely on newlines
+                const r = await reader.read();
+                if (r.done) break;
+                buffer += decoder.decode(r.value, { stream: true });
                 const lines = buffer.split(/\r?\n/);
-                buffer = lines.pop() ?? ""; // keep partial
-
+                buffer = lines.pop() ?? "";
                 for (const line of lines) {
-                  const trimmed = line.trim();
-                  if (!trimmed.startsWith("data:")) continue;
-                  const text = pullTextFromLine(trimmed);
-                  if (text) full += text;
+                  const t = line.trim();
+                  if (!t.startsWith("data:")) continue;
+                  const piece = pickText(t);
+                  if (piece) full += piece;
                 }
               }
-              // flush the last buffered chunk
               if (buffer.startsWith("data:")) {
-                const tail = pullTextFromLine(buffer);
+                const tail = pickText(buffer);
                 if (tail) full += tail;
               }
 
-              if (full.trim().length > 0) {
-                void fetch("/api/log-event", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({
-                    role: "assistant",
-                    text: full,
-                    meta: {
-                      path: location.pathname,
-                      endpoint: url.replace(/^https?:\/\//, ""),
-                      method: `STREAM:${looksStream ? "SSE" : "unknown"}`,
-                    },
-                  }),
-                });
-              }
-            } catch {
-              // best effort only
+              await logAssistant(full, "STREAM:SSE");
             }
-          };
-
-          if (looksStream) {
-            // do not block the UI; parse in background
-            void accumulateAssistant();
           } else {
-            // Non-streaming: clone and try to parse JSON directly
+            // Non-streaming JSON or text
+            const cloned = resp.clone();
+            const raw = await cloned.text();
+            let out = "";
             try {
-              const cloned = resp.clone();
-              const text = await cloned.text();
-              // attempt very tolerant extraction
-              let assistant = "";
-              try {
-                const obj = JSON.parse(text) as Record<string, unknown>;
-                // Responses API can return output_text as string or array
-                const ot = obj["output_text"];
-                if (typeof ot === "string") assistant = ot;
-                else if (Array.isArray(ot) && ot.every(v => typeof v === "string")) {
-                  assistant = (ot as string[]).join("");
-                }
-              } catch {
-                // if plain text, use as is
-                if (typeof text === "string") assistant = text;
-              }
-
-              if (assistant.trim().length > 0) {
-                void fetch("/api/log-event", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({
-                    role: "assistant",
-                    text: assistant,
-                    meta: {
-                      path: location.pathname,
-                      endpoint: url.replace(/^https?:\/\//, ""),
-                      method: "POST:nonstream",
-                    },
-                  }),
-                });
-              }
+              const obj = JSON.parse(raw) as Record<string, unknown>;
+              const ot = obj["output_text"];
+              if (typeof ot === "string") out = ot;
+              else if (Array.isArray(ot) && ot.every(v => typeof v === "string")) out = (ot as string[]).join("");
             } catch {
-              // ignore
+              if (typeof raw === "string") out = raw;
             }
+            await logAssistant(out, "POST:nonstream");
           }
         }
       } catch {
-        // never block
+        // do not block app
       }
 
       return resp;
     };
+
 
 
     // ---- sendBeacon ----
