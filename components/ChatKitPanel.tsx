@@ -315,7 +315,7 @@ export function ChatKitPanel({
     },
   });
 
-  // ---------- ADDED: robust logging interceptor (typed, no `any`) ----------
+    // ---------- ADDED: robust logging interceptor (typed) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -325,26 +325,24 @@ export function ChatKitPanel({
     type TextPart = { type: "text"; text: string };
     type Role = "user" | "assistant" | "system" | "tool";
     type Message = { role: Role; content: string | TextPart[] };
-
-    type ResponsesShape = {
-      input?: string | Message[];
-      messages?: Message[];
-    };
+    type ResponsesShape = { input?: string | Message[]; messages?: Message[] };
 
     function isTextPartArray(v: unknown): v is TextPart[] {
-      return Array.isArray(v) && v.every(p => typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text" && typeof (p as { text?: unknown }).text === "string");
+      return Array.isArray(v) &&
+        v.every(p => typeof p === "object" && p !== null &&
+          (p as { type?: unknown }).type === "text" &&
+          typeof (p as { text?: unknown }).text === "string");
     }
 
     function isMessage(obj: unknown): obj is Message {
       if (typeof obj !== "object" || obj === null) return false;
       const o = obj as { role?: unknown; content?: unknown };
       const roleOk = typeof o.role === "string";
-      const contentOk =
-        typeof o.content === "string" || isTextPartArray(o.content as unknown);
+      const contentOk = typeof o.content === "string" || isTextPartArray(o.content as unknown);
       return roleOk && contentOk;
     }
 
-    function findUserTextFromMessages(messages: Message[] | undefined): string {
+    function findUserTextFromMessages(messages?: Message[]): string {
       if (!messages) return "";
       const u = messages.find(m => m.role === "user");
       if (!u) return "";
@@ -357,19 +355,13 @@ export function ChatKitPanel({
       const p = payload as ResponsesShape | undefined;
       if (!p) return "";
 
-      // Shape 1: { input: "..." }
       if (typeof p.input === "string") return p.input;
-
-      // Shape 2: { input: Message[] }
       if (Array.isArray(p.input) && p.input.every(isMessage)) {
         return findUserTextFromMessages(p.input);
       }
-
-      // Shape 3: { messages: Message[] }
       if (Array.isArray(p.messages) && p.messages.every(isMessage)) {
         return findUserTextFromMessages(p.messages);
       }
-
       return "";
     }
 
@@ -380,9 +372,7 @@ export function ChatKitPanel({
           const clone = input.clone();
           const text = await clone.text();
           return text ? JSON.parse(text) : null;
-        } catch {
-          return null;
-        }
+        } catch { return null; }
       }
       // Otherwise check init.body
       if (init?.body) {
@@ -393,13 +383,14 @@ export function ChatKitPanel({
             return JSON.parse(t);
           }
           // If ReadableStream, skip to avoid consuming it
-          return null;
-        } catch {
-          return null;
-        }
+        } catch { return null; }
       }
       return null;
     }
+
+    // Helpful marker that the interceptor mounted
+    // eslint-disable-next-line no-console
+    console.log("[intercept] mounted");
 
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
@@ -413,28 +404,29 @@ export function ChatKitPanel({
             : String(input);
 
         const method =
-          (init?.method ??
-            (input instanceof Request ? input.method : "GET")).toUpperCase();
+          (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-        // Match common OpenAI endpoints used by ChatKit
-        const isOpenAIEndpoint =
-          /api\.openai\.com\/v1\/(responses|agent-responses|chat\/completions)/.test(
-            urlStr
-          );
+        // Skip our own endpoints
+        if (urlStr.includes("/api/log-event") || urlStr.includes("/api/create-session")) {
+          return originalFetch(input as RequestInfo, init as RequestInit);
+        }
 
-        if (method === "POST" && isOpenAIEndpoint) {
+        // Only inspect POSTs with JSON content-type
+        const ctype =
+          (init?.headers && typeof init.headers === "object"
+            ? (init.headers as Record<string, string>)["content-type"]
+            : undefined) ||
+          (input instanceof Request ? input.headers.get("content-type") ?? undefined : undefined);
+
+        const looksJson = ctype ? /application\/json/i.test(ctype) : true;
+
+        if (method === "POST" && looksJson) {
           const json = await readBodySafely(input, init);
           const userText = extractUserText(json);
 
           if (userText) {
-            // Helpful console line in the browser
             // eslint-disable-next-line no-console
-            console.log(
-              "[intercept] POST →",
-              urlStr,
-              "| userText:",
-              userText.slice(0, 120)
-            );
+            console.log("[intercept] POST →", urlStr, "| userText:", userText.slice(0, 120));
 
             // Fire-and-forget log to your API
             void fetch("/api/log-event", {
@@ -463,6 +455,7 @@ export function ChatKitPanel({
     };
   }, []);
   // ---------- END ADDED ----------
+
 
 
 
