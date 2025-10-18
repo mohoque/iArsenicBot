@@ -315,11 +315,13 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ADDED: robust interceptor for "conversation" + all JSON POSTs ----------
+    // ---------- ADDED: universal logging interceptor (fetch + sendBeacon + XHR) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const originalFetch = window.fetch;
+    const originalBeacon = navigator.sendBeacon?.bind(navigator);
+    const originalXhrSend = XMLHttpRequest.prototype.send;
 
     // Types we care about
     type TextPart = { type: "text"; text: string };
@@ -331,14 +333,13 @@ export function ChatKitPanel({
       return typeof v === "object" && v !== null;
     }
     function isTextPartArray(v: unknown): v is TextPart[] {
-      return Array.isArray(v) && v.every(
-        p => isRecord(p) && p["type"] === "text" && typeof p["text"] === "string"
-      );
+      return Array.isArray(v) &&
+        v.every(p => isRecord(p) && p["type"] === "text" && typeof p["text"] === "string");
     }
     function isMessage(v: unknown): v is Message {
-      return isRecord(v)
-        && typeof v["role"] === "string"
-        && (typeof v["content"] === "string" || isTextPartArray(v["content"]));
+      return isRecord(v) &&
+        typeof v["role"] === "string" &&
+        (typeof v["content"] === "string" || isTextPartArray(v["content"]));
     }
     function firstUserText(messages?: Message[]): string {
       if (!messages) return "";
@@ -357,16 +358,15 @@ export function ChatKitPanel({
       return "";
     }
 
-    async function readBodyAsText(input: RequestInfo | URL, init?: RequestInit): Promise<string> {
+    async function blobToText(b: Blob): Promise<string> {
+      try { return await b.text(); } catch { return ""; }
+    }
+    async function bodyToText(body: unknown): Promise<string> {
       try {
-        if (input instanceof Request) {
-          const clone = input.clone();
-          return await clone.text();
-        }
-        if (init?.body) {
-          if (typeof init.body === "string") return init.body;
-          if (init.body instanceof Blob) return await (init.body as Blob).text();
-        }
+        if (typeof body === "string") return body;
+        if (body instanceof Blob) return blobToText(body);
+        if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
+        if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body as ArrayBufferView as unknown as ArrayBuffer);
       } catch {}
       return "";
     }
@@ -374,36 +374,28 @@ export function ChatKitPanel({
     // eslint-disable-next-line no-console
     console.log("[intercept] mounted");
 
+    // ---- fetch ----
     window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       try {
         const url =
           typeof input === "string" ? input :
           input instanceof URL ? input.toString() :
           input instanceof Request ? input.url : String(input);
-
         const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-        // Skip our own endpoints
-        if (url.includes("/api/log-event") || url.includes("/api/create-session")) {
-          return originalFetch(input as RequestInfo, init as RequestInit);
-        }
+        if (!url.includes("/api/log-event") && method === "POST") {
+          let text = "";
+          if (input instanceof Request) {
+            const clone = input.clone();
+            text = await clone.text();
+          } else if (init?.body) {
+            text = await bodyToText(init.body);
+          }
 
-        // We care about:
-        //  - ChatKit's "conversation" endpoint
-        //  - Any OpenAI v1 JSON POST
-        const looksLikeChatKitConversation = /\/conversation(\?|$)/.test(url);
-        const looksLikeOpenAI =
-          /api\.openai\.com\/v1\/(responses|agent-responses|chat\/completions)/.test(url);
-
-        if (method === "POST" && (looksLikeChatKitConversation || looksLikeOpenAI)) {
-          const bodyText = await readBodyAsText(input, init);
           let parsed: unknown = null;
-          try { parsed = bodyText ? JSON.parse(bodyText) : null; } catch { parsed = null; }
+          try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
 
           const userText = extractUserText(parsed);
-          const sample = bodyText ? bodyText.slice(0, 300) : "";
-
-          // Fire and forget; never block the request
           void fetch("/api/log-event", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -414,25 +406,100 @@ export function ChatKitPanel({
                 path: location.pathname,
                 endpoint: url.replace(/^https?:\/\//, ""),
                 method,
-                bodySample: sample
+                bodySample: text.slice(0, 300)
               }
             })
           });
-
           // eslint-disable-next-line no-console
-          console.log("[intercept] POST ->", url, "| userText:", (userText || "").slice(0, 120));
+          console.log("[intercept] POST(fetch) ->", url, "| userText:", (userText || "").slice(0, 120));
         }
       } catch {}
-
       return originalFetch(input as RequestInfo, init as RequestInit);
+    };
+
+    // ---- sendBeacon ----
+    if (originalBeacon) {
+      navigator.sendBeacon = ((url: string | URL, data?: BodyInit | null) => {
+        try {
+          const href = typeof url === "string" ? url : url.toString();
+          if (!href.includes("/api/log-event")) {
+            void (async () => {
+              const text = await bodyToText(data ?? "");
+              let parsed: unknown = null;
+              try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+              const userText = extractUserText(parsed);
+              void fetch("/api/log-event", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  role: "user",
+                  text: userText || "",
+                  meta: {
+                    path: location.pathname,
+                    endpoint: href.replace(/^https?:\/\//, ""),
+                    method: "BEACON",
+                    bodySample: text.slice(0, 300)
+                  }
+                })
+              });
+              // eslint-disable-next-line no-console
+              console.log("[intercept] POST(beacon) ->", href, "| userText:", (userText || "").slice(0, 120));
+            })();
+          }
+        } catch {}
+        return originalBeacon(url, data);
+      }) as typeof navigator.sendBeacon;
+    }
+
+    // ---- XHR ----
+    XMLHttpRequest.prototype.send = function (this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
+      try {
+        const url = (this as XMLHttpRequest & { __url?: string }).__url ?? this.responseURL;
+        const method = (this as XMLHttpRequest & { __method?: string }).__method ?? "POST";
+        if (method === "POST" && url && !url.includes("/api/log-event")) {
+          void (async () => {
+            const text = await bodyToText(body ?? "");
+            let parsed: unknown = null;
+            try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+            const userText = extractUserText(parsed);
+            void fetch("/api/log-event", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                role: "user",
+                text: userText || "",
+                meta: {
+                  path: location.pathname,
+                  endpoint: url.replace(/^https?:\/\//, ""),
+                  method: "XHR",
+                  bodySample: text.slice(0, 300)
+                }
+              })
+            });
+            // eslint-disable-next-line no-console
+            console.log("[intercept] POST(xhr) ->", url, "| userText:", (userText || "").slice(0, 120));
+          })();
+        }
+      } catch {}
+      return originalXhrSend.call(this, body as never);
+    };
+
+    // Patch open() to remember method and URL
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method: string, url: string | URL) {
+      (this as XMLHttpRequest & { __url?: string; __method?: string }).__url = typeof url === "string" ? url : url.toString();
+      (this as XMLHttpRequest & { __url?: string; __method?: string }).__method = method.toUpperCase();
+      return originalXhrOpen.apply(this, arguments as unknown as any);
     };
 
     return () => {
       window.fetch = originalFetch;
+      if (originalBeacon) navigator.sendBeacon = originalBeacon;
+      XMLHttpRequest.prototype.send = originalXhrSend;
+      XMLHttpRequest.prototype.open = originalXhrOpen;
     };
   }, []);
   // ---------- END ADDED ----------
-
 
 
   const activeError = errors.session ?? errors.integration;
