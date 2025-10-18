@@ -315,52 +315,76 @@ export function ChatKitPanel({
     },
   });
 
-    // ---------- ROBUST INTERCEPTOR: capture user turns and log them ----------
+  // ---------- ADDED: robust logging interceptor (typed, no `any`) ----------
   useEffect(() => {
     if (typeof window === "undefined") return;
 
     const originalFetch = window.fetch;
 
-    function extractUserText(json: any): string {
+    // Minimal shapes we care about
+    type TextPart = { type: "text"; text: string };
+    type Role = "user" | "assistant" | "system" | "tool";
+    type Message = { role: Role; content: string | TextPart[] };
+
+    type ResponsesShape = {
+      input?: string | Message[];
+      messages?: Message[];
+    };
+
+    function isTextPartArray(v: unknown): v is TextPart[] {
+      return Array.isArray(v) && v.every(p => typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text" && typeof (p as { text?: unknown }).text === "string");
+    }
+
+    function isMessage(obj: unknown): obj is Message {
+      if (typeof obj !== "object" || obj === null) return false;
+      const o = obj as { role?: unknown; content?: unknown };
+      const roleOk = typeof o.role === "string";
+      const contentOk =
+        typeof o.content === "string" || isTextPartArray(o.content as unknown);
+      return roleOk && contentOk;
+    }
+
+    function findUserTextFromMessages(messages: Message[] | undefined): string {
+      if (!messages) return "";
+      const u = messages.find(m => m.role === "user");
+      if (!u) return "";
+      if (typeof u.content === "string") return u.content;
+      const t = u.content.find(part => part.type === "text");
+      return t ? t.text : "";
+    }
+
+    function extractUserText(payload: unknown): string {
+      const p = payload as ResponsesShape | undefined;
+      if (!p) return "";
+
       // Shape 1: { input: "..." }
-      if (typeof json?.input === "string") return json.input;
+      if (typeof p.input === "string") return p.input;
 
-      // Shape 2: { input: [ {role:"user", content:[{type:"text", text:"..."}]} ] }
-      if (Array.isArray(json?.input)) {
-        const u = json.input.find((x: any) => x?.role === "user");
-        if (u?.content) {
-          if (typeof u.content === "string") return u.content;
-          if (Array.isArray(u.content)) {
-            const t = u.content.find((c: any) => c?.type === "text")?.text;
-            if (typeof t === "string") return t;
-          }
-        }
+      // Shape 2: { input: Message[] }
+      if (Array.isArray(p.input) && p.input.every(isMessage)) {
+        return findUserTextFromMessages(p.input);
       }
 
-      // Shape 3: { messages: [ {role:"user", content:"..."} ] }
-      if (Array.isArray(json?.messages)) {
-        const u = json.messages.find((m: any) => m?.role === "user");
-        if (u?.content) {
-          if (typeof u.content === "string") return u.content;
-          if (Array.isArray(u.content)) {
-            const t = u.content.find((c: any) => c?.type === "text")?.text;
-            if (typeof t === "string") return t;
-          }
-        }
+      // Shape 3: { messages: Message[] }
+      if (Array.isArray(p.messages) && p.messages.every(isMessage)) {
+        return findUserTextFromMessages(p.messages);
       }
+
       return "";
     }
 
-    async function readBodySafely(input: RequestInfo | URL, init?: RequestInit) {
-      // Try Request instance first
+    async function readBodySafely(input: RequestInfo | URL, init?: RequestInit): Promise<unknown> {
+      // If a Request was passed, clone and read its body
       if (input instanceof Request) {
         try {
           const clone = input.clone();
           const text = await clone.text();
-          if (text) return JSON.parse(text);
-        } catch {}
+          return text ? JSON.parse(text) : null;
+        } catch {
+          return null;
+        }
       }
-      // Then handle init.body variants
+      // Otherwise check init.body
       if (init?.body) {
         try {
           if (typeof init.body === "string") return JSON.parse(init.body);
@@ -368,8 +392,11 @@ export function ChatKitPanel({
             const t = await (init.body as Blob).text();
             return JSON.parse(t);
           }
-          // If it is a ReadableStream, skip to avoid consuming it
-        } catch {}
+          // If ReadableStream, skip to avoid consuming it
+          return null;
+        } catch {
+          return null;
+        }
       }
       return null;
     }
@@ -389,17 +416,19 @@ export function ChatKitPanel({
           (init?.method ??
             (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-        // Intercept any OpenAI POST that likely carries a user turn
-        if (
-          method === "POST" &&
+        // Match common OpenAI endpoints used by ChatKit
+        const isOpenAIEndpoint =
           /api\.openai\.com\/v1\/(responses|agent-responses|chat\/completions)/.test(
             urlStr
-          )
-        ) {
+          );
+
+        if (method === "POST" && isOpenAIEndpoint) {
           const json = await readBodySafely(input, init);
           const userText = extractUserText(json);
 
           if (userText) {
+            // Helpful console line in the browser
+            // eslint-disable-next-line no-console
             console.log(
               "[intercept] POST →",
               urlStr,
@@ -407,7 +436,7 @@ export function ChatKitPanel({
               userText.slice(0, 120)
             );
 
-            // Fire-and-forget so we never block the chat
+            // Fire-and-forget log to your API
             void fetch("/api/log-event", {
               method: "POST",
               headers: { "content-type": "application/json" },
@@ -423,17 +452,18 @@ export function ChatKitPanel({
           }
         }
       } catch {
-        // swallow errors; never break the original call
+        // Never block the original request
       }
 
-      return originalFetch(input as any, init as any);
+      return originalFetch(input as RequestInfo, init as RequestInit);
     };
 
     return () => {
       window.fetch = originalFetch;
     };
   }, []);
-  // ---------- END ROBUST INTERCEPTOR ----------
+  // ---------- END ADDED ----------
+
 
 
   const activeError = errors.session ?? errors.integration;
